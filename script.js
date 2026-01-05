@@ -176,41 +176,6 @@
     }
 
     /**
-     * Create and add extraction button to the page
-     */
-    function addExtractionButton() {
-        const button = document.createElement('button');
-        button.textContent = 'Extract';
-        button.style.cssText = `
-            position: fixed;
-            bottom: 28px;
-            right: 80px;
-            padding: 10px 15px;
-            background-color: #4CAF50;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-family: Arial, sans-serif;
-            font-size: 14px;
-            z-index: 10000;
-            transition: background-color 0.3s ease;
-        `;
-
-        button.addEventListener('mouseover', () => {
-            button.style.backgroundColor = '#45a049';
-        });
-
-        button.addEventListener('mouseout', () => {
-            button.style.backgroundColor = '#4CAF50';
-        });
-
-        button.addEventListener('click', extractAndCopyLocalStorage);
-
-        document.body.appendChild(button);
-    }
-
-    /**
      * Create and add run button to the page
      */
     function addRunButton() {
@@ -575,14 +540,12 @@
         // Wait for page to load
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', () => {
-                addExtractionButton();
                 addRunButton();
                 addMergeButton();
                 addKeyboardShortcut();
                 monitorForNsbox();
             });
         } else {
-            addExtractionButton();
             addRunButton();
             addMergeButton();
             addKeyboardShortcut();
