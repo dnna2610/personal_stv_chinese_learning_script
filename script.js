@@ -211,7 +211,7 @@
         button.style.cssText = `
             position: fixed;
             bottom: 28px;
-            right: 160px;
+            right: 80px;
             padding: 10px 15px;
             background-color: #2196F3;
             color: white;
@@ -259,7 +259,7 @@
         button.style.cssText = `
             position: fixed;
             bottom: 28px;
-            right: 230px;
+            right: 150px;
             padding: 10px 15px;
             background-color: #FF9800;
             color: white;
@@ -507,7 +507,10 @@
             // For pinyin v4.0.0 UMD build, the API is: pinyin.pinyin(text, options)
             const result = pinyin.pinyin(chineseText, {
                 toneType: 'symbol', // 'symbol' for tone marks (mā), 'num' for numbers (ma1), 'none' for no tones
-                type: 'array' // Return as array
+                type: 'array', // Return as array,
+                heteronym: true,
+                segment: true,
+                group: true
             });
 
             console.log('Pinyin result:', result);
