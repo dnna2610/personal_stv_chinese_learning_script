@@ -5,11 +5,38 @@
 // @description  Extract localStorage values and copy to clipboard
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
+// @require      https://cdn.jsdelivr.net/npm/pinyin@4.0.0/lib/umd/pinyin.min.js
 // @grant        none
 // ==/UserScript==
 
 (function() {
     'use strict';
+
+    /**
+     * Load pinyin library dynamically
+     */
+    function loadPinyinLibrary() {
+        return new Promise((resolve, reject) => {
+            // Check if already loaded
+            if (typeof pinyin !== 'undefined') {
+                resolve();
+                return;
+            }
+
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/pinyin@4.0.0/lib/umd/pinyin.min.js';
+            script.crossOrigin = 'anonymous';
+            script.onload = () => {
+                console.log('Pinyin library loaded successfully');
+                resolve();
+            };
+            script.onerror = () => {
+                console.error('Failed to load pinyin library');
+                reject(new Error('Failed to load pinyin library'));
+            };
+            document.head.appendChild(script);
+        });
+    }
 
     /**
      * Extract localStorage key pattern from URL
@@ -463,6 +490,136 @@
     }
 
     /**
+     * Get pinyin for Chinese text using pinyin.js library
+     */
+    function getPinyin(chineseText) {
+        try {
+            // Check if pinyin library is loaded
+            if (typeof pinyin === 'undefined' || typeof pinyin.pinyin === 'undefined') {
+                console.error('Pinyin library not loaded');
+                return 'Library not loaded';
+            }
+
+            console.log('Converting to pinyin:', chineseText);
+            console.log('Pinyin object:', pinyin);
+
+            // Convert to pinyin with tone marks
+            // For pinyin v4.0.0 UMD build, the API is: pinyin.pinyin(text, options)
+            const result = pinyin.pinyin(chineseText, {
+                toneType: 'symbol', // 'symbol' for tone marks (mā), 'num' for numbers (ma1), 'none' for no tones
+                type: 'array' // Return as array
+            });
+
+            console.log('Pinyin result:', result);
+
+            // Join the result into a single string
+            if (Array.isArray(result)) {
+                return result.join(' ');
+            }
+
+            return result || '';
+        } catch (error) {
+            console.error('Error converting to pinyin:', error);
+            return 'Error: ' + error.message;
+        }
+    }
+
+    /**
+     * Update pinyin when Chinese input changes
+     */
+    function updatePinyin() {
+        console.log('updatePinyin called');
+        const zwInput = document.getElementById('zw');
+        const pinyinInput = document.getElementById('pinyin');
+
+        console.log('zwInput:', zwInput);
+        console.log('pinyinInput:', pinyinInput);
+
+        if (!zwInput || !pinyinInput) {
+            console.log('Missing inputs, zwInput:', !!zwInput, 'pinyinInput:', !!pinyinInput);
+            return;
+        }
+
+        const chineseText = zwInput.value.trim();
+        console.log('Chinese text:', chineseText);
+
+        if (!chineseText) {
+            pinyinInput.value = '';
+            return;
+        }
+
+        // Get pinyin using the library
+        const pinyinResult = getPinyin(chineseText);
+        console.log('Setting pinyin input to:', pinyinResult);
+        pinyinInput.value = pinyinResult;
+    }
+
+    /**
+     * Add pinyin row to nsbox
+     */
+    function addPinyinRow() {
+        console.log('addPinyinRow called');
+        const nsbox = document.getElementById('nsbox');
+        if (!nsbox) {
+            console.log('nsbox not found');
+            return;
+        }
+
+        // Check if pinyin row already exists
+        if (document.getElementById('pinyin')) {
+            console.log('Pinyin row already exists');
+            return;
+        }
+
+        // Find the row with the "zw" input
+        const zwRow = Array.from(nsbox.querySelectorAll('.row')).find(row =>
+            row.querySelector('#zw')
+        );
+
+        if (!zwRow) {
+            console.log('zw row not found');
+            return;
+        }
+
+        console.log('Creating pinyin row');
+
+        // Create pinyin row with a button to get pinyin
+        const pinyinRow = document.createElement('div');
+        pinyinRow.className = 'row';
+        pinyinRow.innerHTML = `
+            <span style="display:inline-block;width:30px;color:white;font-size:12px;padding:6px;background:green;">py</span>
+            <input class="col" style="padding:0;font-size: 12px;" id="pinyin" placeholder="Pinyin" readonly>
+            <button class="btn btn-info" type="button" id="getPinyinBtn" style="font-size: 12px;"><i class="fas fa-language"></i></button>
+        `;
+
+        // Insert the pinyin row after the zw row
+        zwRow.parentNode.insertBefore(pinyinRow, zwRow.nextSibling);
+        console.log('Pinyin row inserted');
+
+        // Add click event to the pinyin button
+        const getPinyinBtn = document.getElementById('getPinyinBtn');
+        if (getPinyinBtn) {
+            console.log('Adding click listener to pinyin button');
+            getPinyinBtn.addEventListener('click', updatePinyin);
+        }
+
+        // Also add input event listener to zw input for automatic update
+        const zwInput = document.getElementById('zw');
+        if (zwInput) {
+            console.log('Adding event listener to zw input');
+            zwInput.addEventListener('input', updatePinyin);
+
+            // Also trigger immediately if there's already text
+            if (zwInput.value.trim()) {
+                console.log('Triggering initial pinyin update');
+                updatePinyin();
+            }
+        } else {
+            console.log('zw input not found for event listener');
+        }
+    }
+
+    /**
      * Add button to the nsbox element
      */
     function addButtonToNsbox() {
@@ -502,6 +659,9 @@
                 zwRow.appendChild(addButton);
             }
         }
+
+        // Add pinyin row
+        addPinyinRow();
     }
 
     /**
@@ -536,7 +696,14 @@
     /**
      * Initialize the script
      */
-    function init() {
+    async function init() {
+        // Load pinyin library first
+        try {
+            await loadPinyinLibrary();
+        } catch (error) {
+            console.error('Could not load pinyin library:', error);
+        }
+
         // Wait for page to load
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', () => {
