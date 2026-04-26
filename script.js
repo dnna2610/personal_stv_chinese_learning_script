@@ -302,7 +302,7 @@
         button.style.cssText = `
             position: fixed;
             bottom: 28px;
-            right: 220px;
+            right: 228px;
             padding: 10px 15px;
             background-color: #9C27B0;
             color: white;
