@@ -5,6 +5,9 @@
 // @description  Extract localStorage values and copy to clipboard
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
+// @match        https://sangtacviet.vip/truyen/*/*
+// @match        https://sangtacviet.vn/truyen/*/*
+// @include      /^https?:\/\/sangtacviet\.[a-z]+\/truyen\/.*$/
 // @require      https://cdn.jsdelivr.net/npm/pinyin@4.0.0/lib/umd/pinyin.min.js
 // @grant        none
 // ==/UserScript==
@@ -394,7 +397,7 @@
             const chars = [...t];
             if (chars.length === 0) return;
             if (chars.every(ch => knownChars.has(ch))) {
-                el.style.backgroundColor = '#FFEB3B';
+                el.style.backgroundColor = '#893bff';
                 el.setAttribute('data-scan-highlighted', '1');
                 count++;
             }
