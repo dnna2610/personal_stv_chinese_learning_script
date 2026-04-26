@@ -484,9 +484,6 @@
 
         console.log(`Added "${newEntry}" to localStorage["${storageKey}"]`);
         showNotification(`Added "${chineseText}" to localStorage!`, 'success');
-
-        // Clear the input field
-        zwInput.value = '';
     }
 
     /**
