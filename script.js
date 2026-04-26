@@ -286,6 +286,129 @@
     }
 
     /**
+     * Create and add scan toggle button to the page.
+     * When active, highlights all <i t="..."> segments whose Chinese text
+     * matches a "$X=X" entry in the current story's localStorage.
+     * Click again to remove the highlights.
+     *
+     * Note: only re-scans when toggled. If new content loads while active,
+     * toggle off and on again to re-scan.
+     */
+    function addScanButton() {
+        let isScanActive = false;
+
+        const button = document.createElement('button');
+        button.textContent = 'Scan';
+        button.style.cssText = `
+            position: fixed;
+            bottom: 28px;
+            right: 220px;
+            padding: 10px 15px;
+            background-color: #9C27B0;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            z-index: 10000;
+            transition: background-color 0.3s ease;
+        `;
+
+        button.addEventListener('mouseover', () => {
+            button.style.backgroundColor = isScanActive ? '#388E3C' : '#7B1FA2';
+        });
+
+        button.addEventListener('mouseout', () => {
+            button.style.backgroundColor = isScanActive ? '#4CAF50' : '#9C27B0';
+        });
+
+        button.addEventListener('click', () => {
+            if (!isScanActive) {
+                const count = activateScanHighlight();
+                if (count === null) {
+                    // Error or no-op: keep the button inactive.
+                    return;
+                }
+                isScanActive = true;
+                button.textContent = 'Scan ✓';
+                button.style.backgroundColor = '#4CAF50';
+            } else {
+                deactivateScanHighlight();
+                isScanActive = false;
+                button.textContent = 'Scan';
+                button.style.backgroundColor = '#9C27B0';
+            }
+        });
+
+        document.body.appendChild(button);
+    }
+
+    /**
+     * Highlight every <i t="..."> whose `t` (trimmed) matches a known
+     * "$X=X" entry in the current story's localStorage.
+     * Returns the count of highlighted nodes, or null if it bailed out
+     * (no story key, no storage value, or no known entries to match).
+     */
+    function activateScanHighlight() {
+        const storageKey = getLocalStorageKeyFromURL();
+        if (!storageKey) {
+            showNotification('Could not determine localStorage key from URL', 'error');
+            return null;
+        }
+
+        const raw = localStorage.getItem(storageKey);
+        if (!raw) {
+            showNotification(`localStorage key "${storageKey}" not found`, 'error');
+            return null;
+        }
+
+        // Build the set of known Chinese segments — entries where left === right.
+        const knownSet = new Set();
+        raw.split('~//~').forEach(entry => {
+            if (!entry.trim()) return;
+            const m = entry.match(/^\$(.+)=(.+)$/);
+            if (!m) return;
+            const left = m[1].trim();
+            const right = m[2].trim();
+            if (left && left === right) {
+                knownSet.add(left);
+            }
+        });
+
+        if (knownSet.size === 0) {
+            showNotification('No known characters in this story yet', 'info');
+            return null;
+        }
+
+        let count = 0;
+        document.querySelectorAll('i[t]').forEach(el => {
+            const t = (el.getAttribute('t') || '').trim();
+            if (!t) return;
+            if (knownSet.has(t)) {
+                el.style.backgroundColor = '#FFEB3B';
+                el.setAttribute('data-scan-highlighted', '1');
+                count++;
+            }
+        });
+
+        showNotification(`Highlighted ${count} known segment(s)`, 'success');
+        return count;
+    }
+
+    /**
+     * Remove all highlights applied by activateScanHighlight().
+     */
+    function deactivateScanHighlight() {
+        const nodes = document.querySelectorAll('i[data-scan-highlighted="1"]');
+        nodes.forEach(el => {
+            el.style.backgroundColor = '';
+            el.removeAttribute('data-scan-highlighted');
+        });
+        return nodes.length;
+    }
+
+    /**
      * Merge characters between global and story storage
      */
     function mergeStorages() {
@@ -709,6 +832,68 @@
 
         // Add pinyin row
         addPinyinRow();
+
+        // Add the "Hoa Toàn Bộ" button next to the English "Dùng" button
+        addCapitalizeAllButton();
+    }
+
+    /**
+     * Add a "Hoa Toàn Bộ" button next to the English "Dùng" button
+     * (the one that calls addSuperName('el')) so users can also call
+     * addSuperName('el', 'a') in one click.
+     */
+    function addCapitalizeAllButton() {
+        // Avoid duplicates
+        if (document.getElementById('capitalizeEnglishBtn')) {
+            return;
+        }
+
+        // Find the English "Dùng" button — it has onclick="addSuperName('el')"
+        const dungBtn = document.querySelector('button[onclick="addSuperName(\'el\')"]');
+        if (!dungBtn) {
+            return;
+        }
+
+        const newBtn = document.createElement('button');
+        newBtn.id = 'capitalizeEnglishBtn';
+        newBtn.type = 'button';
+        newBtn.textContent = 'Hoa Toàn Bộ';
+        newBtn.style.float = 'right';
+        newBtn.style.marginRight = '4px';
+
+        // addSuperName('el','a') doesn't work, so instead we title-case the
+        // input value ourselves (capitalize the first letter of each word,
+        // like a name) and then call the regular addSuperName('el').
+        newBtn.addEventListener('click', () => {
+            const englishInput = document.getElementById('addnameboxip4');
+            if (!englishInput) {
+                showNotification('Could not find English input field', 'error');
+                return;
+            }
+
+            const value = englishInput.value.trim();
+            if (!value) {
+                showNotification('Please enter English text first', 'error');
+                return;
+            }
+
+            // Title-case: uppercase the first letter of each whitespace-
+            // separated word, lowercase the rest. e.g. "john smith" -> "John Smith".
+            englishInput.value = value
+                .toLowerCase()
+                .replace(/\b\p{L}/gu, ch => ch.toUpperCase());
+
+            if (typeof addSuperName === 'function') {
+                addSuperName('el');
+            } else {
+                showNotification('addSuperName function not available', 'error');
+            }
+        });
+
+        // Insert before the Dùng button so they sit side-by-side
+        // (with float: right, the first DOM element ends up on the right,
+        //  so this places "Hoa Toàn Bộ" immediately to the LEFT of "Dùng")
+        dungBtn.parentNode.insertBefore(newBtn, dungBtn);
     }
 
     /**
@@ -762,6 +947,7 @@
         } else {
             addRunButton();
             addMergeButton();
+            addScanButton();
             addKeyboardShortcut();
             monitorForNsbox();
         }
