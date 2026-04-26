@@ -328,9 +328,17 @@
             }
         });
 
-        // Add global entries to story if not present (all entries)
+        // Add global entries to story if not present (skip single-character entries)
         globalEntries.forEach(entry => {
             if (!storySet.has(entry)) {
+                const match = entry.match(/^\$(.+)=(.+)$/);
+                if (match) {
+                    const leftSide = match[1].trim();
+                    // Skip single-character entries from global to story
+                    if ([...leftSide].length <= 1) {
+                        return;
+                    }
+                }
                 storyEntries.push(entry);
                 addedToStory++;
             }
