@@ -563,6 +563,38 @@
     }
 
     /**
+     * Pronounce the Chinese text in the #zw input using the browser's speech synthesis
+     */
+    function speakChinese() {
+        const zwInput = document.getElementById('zw');
+        const text = zwInput ? zwInput.value.trim() : '';
+
+        if (!text) {
+            showNotification('Please enter Chinese text first', 'error');
+            return;
+        }
+
+        if (!('speechSynthesis' in window)) {
+            showNotification('Speech synthesis not supported in this browser', 'error');
+            return;
+        }
+
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = 'zh-CN';
+        utterance.rate = 0.9;
+
+        // Prefer a Chinese voice if one is installed
+        const voices = speechSynthesis.getVoices();
+        const zhVoice = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('zh'));
+        if (zhVoice) {
+            utterance.voice = zhVoice;
+        }
+
+        speechSynthesis.cancel(); // stop anything currently speaking
+        speechSynthesis.speak(utterance);
+    }
+
+    /**
      * Add pinyin row to nsbox
      */
     function addPinyinRow() {
@@ -598,6 +630,7 @@
             <span style="display:inline-block;width:30px;color:white;font-size:12px;padding:6px;background:green;">py</span>
             <input class="col" style="padding:0;font-size: 12px;" id="pinyin" placeholder="Pinyin" readonly>
             <button class="btn btn-info" type="button" id="getPinyinBtn" style="font-size: 12px;"><i class="fas fa-language"></i></button>
+            <button class="btn btn-warning" type="button" id="speakChineseBtn" style="font-size: 12px;" title="Pronounce Chinese word"><i class="fas fa-volume-up"></i></button>
         `;
 
         // Insert the pinyin row after the zw row
@@ -609,6 +642,12 @@
         if (getPinyinBtn) {
             console.log('Adding click listener to pinyin button');
             getPinyinBtn.addEventListener('click', updatePinyin);
+        }
+
+        // Add click event to the speak button
+        const speakBtn = document.getElementById('speakChineseBtn');
+        if (speakBtn) {
+            speakBtn.addEventListener('click', speakChinese);
         }
 
         // Also add input event listener to zw input for automatic update
