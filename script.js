@@ -363,8 +363,11 @@
             return null;
         }
 
-        // Build the set of known Chinese segments — entries where left === right.
-        const knownSet = new Set();
+        // Build the set of known Chinese characters — pulled per-character
+        // from any "$X=X" entry's left side. So if the user has added either
+        // "$了=了" or a phrase like "$阿根廷=阿根廷", each individual character
+        // (了, 阿, 根, 廷) is treated as known.
+        const knownChars = new Set();
         raw.split('~//~').forEach(entry => {
             if (!entry.trim()) return;
             const m = entry.match(/^\$(.+)=(.+)$/);
@@ -372,11 +375,13 @@
             const left = m[1].trim();
             const right = m[2].trim();
             if (left && left === right) {
-                knownSet.add(left);
+                for (const ch of left) {
+                    knownChars.add(ch);
+                }
             }
         });
 
-        if (knownSet.size === 0) {
+        if (knownChars.size === 0) {
             showNotification('No known characters in this story yet', 'info');
             return null;
         }
@@ -385,7 +390,10 @@
         document.querySelectorAll('i[t]').forEach(el => {
             const t = (el.getAttribute('t') || '').trim();
             if (!t) return;
-            if (knownSet.has(t)) {
+            // Highlight only when every character in `t` is individually known.
+            const chars = [...t];
+            if (chars.length === 0) return;
+            if (chars.every(ch => knownChars.has(ch))) {
                 el.style.backgroundColor = '#FFEB3B';
                 el.setAttribute('data-scan-highlighted', '1');
                 count++;
