@@ -397,7 +397,7 @@
             const chars = [...t];
             if (chars.length === 0) return;
             if (chars.every(ch => knownChars.has(ch))) {
-                el.style.backgroundColor = '#893bff';
+                el.style.backgroundColor = pickHighlightColor(el);
                 el.setAttribute('data-scan-highlighted', '1');
                 count++;
             }
@@ -405,6 +405,25 @@
 
         showNotification(`Highlighted ${count} known segment(s)`, 'success');
         return count;
+    }
+
+    /**
+     * Pick a highlight background color that contrasts with the element's
+     * current text color. Day mode (dark text) gets a vivid purple, night
+     * mode (light text) gets a deeper indigo so white text stays readable.
+     */
+    function pickHighlightColor(el) {
+        const color = getComputedStyle(el).color;
+        const m = color.match(/\d+(\.\d+)?/g);
+        if (!m || m.length < 3) {
+            return '#893bff';
+        }
+        const r = parseFloat(m[0]);
+        const g = parseFloat(m[1]);
+        const b = parseFloat(m[2]);
+        // Perceived luminance (0..1). >0.5 = light text → night mode.
+        const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+        return luminance > 0.5 ? '#311B92' : '#893bff';
     }
 
     /**
