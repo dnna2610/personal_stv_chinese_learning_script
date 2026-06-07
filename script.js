@@ -348,6 +348,43 @@
     }
 
     /**
+     * Create and add the "Wipe" button to the page, positioned to the left
+     * of the Scan button. Removes all Chinese-character ("$X=X") entries
+     * from the current story's localStorage while keeping everything else.
+     */
+    function addWipeButton() {
+        const button = document.createElement('button');
+        button.textContent = 'Wipe';
+        button.style.cssText = `
+            position: fixed;
+            bottom: 28px;
+            right: 306px;
+            padding: 10px 15px;
+            background-color: #E53935;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            z-index: 10000;
+            transition: background-color 0.3s ease;
+        `;
+
+        button.addEventListener('mouseover', () => {
+            button.style.backgroundColor = '#C62828';
+        });
+
+        button.addEventListener('mouseout', () => {
+            button.style.backgroundColor = '#E53935';
+        });
+
+        button.addEventListener('click', wipeChineseCharacters);
+
+        document.body.appendChild(button);
+    }
+
+    /**
      * Highlight every <i t="..."> whose `t` (trimmed) matches a known
      * "$X=X" entry in the current story's localStorage.
      * Returns the count of highlighted nodes, or null if it bailed out
@@ -436,6 +473,57 @@
             el.removeAttribute('data-scan-highlighted');
         });
         return nodes.length;
+    }
+
+    /**
+     * Remove all Chinese-character entries ("$X=X", where the left side
+     * equals the right side) from the current story's localStorage, while
+     * keeping every other entry (real translations, names, etc.).
+     */
+    function wipeChineseCharacters() {
+        const storageKey = getLocalStorageKeyFromURL();
+
+        if (!storageKey) {
+            console.log('Could not determine localStorage key from URL');
+            showNotification('Could not determine localStorage key from URL', 'error');
+            return;
+        }
+
+        const currentValue = localStorage.getItem(storageKey);
+        if (currentValue === null) {
+            showNotification(`localStorage key "${storageKey}" not found`, 'error');
+            return;
+        }
+
+        const entries = currentValue.split('~//~').filter(entry => entry.trim());
+
+        // Keep every entry that is NOT a "$X=X" self-mapping (Chinese character).
+        const keptEntries = entries.filter(entry => {
+            const match = entry.match(/^\$(.+)=(.+)$/);
+            if (!match) return true;
+            const leftSide = match[1].trim();
+            const rightSide = match[2].trim();
+            // Drop only entries where both sides are identical (Chinese characters).
+            return leftSide !== rightSide;
+        });
+
+        const removedCount = entries.length - keptEntries.length;
+
+        if (removedCount === 0) {
+            showNotification('No Chinese characters to wipe in this story', 'info');
+            return;
+        }
+
+        if (!window.confirm(`Remove ${removedCount} Chinese character entr${removedCount === 1 ? 'y' : 'ies'} from this story? Other entries are kept.`)) {
+            return;
+        }
+
+        const newValue = keptEntries.length > 0 ? keptEntries.join('~//~') + '~//~' : '';
+        localStorage.setItem(storageKey, newValue);
+
+        const message = `Wiped ${removedCount} Chinese character entr${removedCount === 1 ? 'y' : 'ies'} from "${storageKey}"`;
+        console.log(message);
+        showNotification(message, 'success');
     }
 
     /**
@@ -977,6 +1065,7 @@
         } else {
             addRunButton();
             addMergeButton();
+            addWipeButton();
             addScanButton();
             addKeyboardShortcut();
             monitorForNsbox();
