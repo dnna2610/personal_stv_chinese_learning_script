@@ -661,25 +661,9 @@
     function addLearnButton() {
         const button = document.createElement('button');
         button.textContent = 'Học';
-        button.style.cssText = `
-            position: fixed;
-            bottom: 28px;
-            right: 384px;
-            padding: 10px 15px;
-            background-color: #00897B;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-family: Arial, sans-serif;
-            font-size: 14px;
-            z-index: 10000;
-            transition: background-color 0.3s ease;
-        `;
-        button.addEventListener('mouseover', () => { button.style.backgroundColor = '#00695C'; });
-        button.addEventListener('mouseout', () => { button.style.backgroundColor = '#00897B'; });
+        styleBarButton(button, '#00897B', '#00695C');
         button.addEventListener('click', togglePanel);
-        document.body.appendChild(button);
+        ensureButtonBar().appendChild(button);
     }
 
     function injectStyles() {
@@ -788,6 +772,14 @@
                 outline: 3px solid #FFD54F !important;
                 outline-offset: 2px;
                 transition: outline-color 0.3s ease;
+            }
+            @media (max-width: 480px) {
+                #stv-learn-panel {
+                    left: 8px;
+                    right: 8px;
+                    width: auto;
+                    bottom: 130px;
+                }
             }
         `;
         document.head.appendChild(style);
@@ -923,28 +915,55 @@
     }
 
     /**
-     * Create and add run button to the page
+     * Shared container for the floating buttons. A wrapping flex row
+     * anchored bottom-right: on narrow (mobile) screens buttons wrap into
+     * extra rows above instead of running off the left edge.
+     * First-added button renders rightmost (row-reverse).
      */
-    function addRunButton() {
-        const button = document.createElement('button');
-        button.textContent = 'Chạy';
-        button.style.cssText = `
+    let buttonBarEl = null;
+    function ensureButtonBar() {
+        if (buttonBarEl) return buttonBarEl;
+        buttonBarEl = document.createElement('div');
+        buttonBarEl.id = 'stv-button-bar';
+        buttonBarEl.style.cssText = `
             position: fixed;
             bottom: 28px;
             right: 80px;
+            display: flex;
+            flex-direction: row-reverse;
+            flex-wrap: wrap;
+            gap: 6px;
+            justify-content: flex-start;
+            max-width: calc(100vw - 96px);
+            z-index: 10000;
+        `;
+        document.body.appendChild(buttonBarEl);
+        return buttonBarEl;
+    }
+
+    function styleBarButton(button, color, hoverColor) {
+        button.style.cssText = `
             padding: 10px 15px;
-            background-color: #2196F3;
+            background-color: ${color};
             color: white;
             border: none;
             border-radius: 5px;
             cursor: pointer;
             font-family: Arial, sans-serif;
             font-size: 14px;
-            z-index: 10000;
             transition: background-color 0.3s ease;
         `;
-        button.addEventListener('mouseover', () => { button.style.backgroundColor = '#1976D2'; });
-        button.addEventListener('mouseout', () => { button.style.backgroundColor = '#2196F3'; });
+        button.addEventListener('mouseover', () => { button.style.backgroundColor = hoverColor; });
+        button.addEventListener('mouseout', () => { button.style.backgroundColor = color; });
+    }
+
+    /**
+     * Create and add run button to the page
+     */
+    function addRunButton() {
+        const button = document.createElement('button');
+        button.textContent = 'Chạy';
+        styleBarButton(button, '#2196F3', '#1976D2');
         button.addEventListener('click', () => {
             try {
                 if (typeof saveNS === 'function') saveNS();
@@ -955,7 +974,7 @@
                 showNotification('Error executing run functions', 'error');
             }
         });
-        document.body.appendChild(button);
+        ensureButtonBar().appendChild(button);
     }
 
     /**
@@ -964,25 +983,9 @@
     function addMergeButton() {
         const button = document.createElement('button');
         button.textContent = 'Merge';
-        button.style.cssText = `
-            position: fixed;
-            bottom: 28px;
-            right: 150px;
-            padding: 10px 15px;
-            background-color: #FF9800;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-family: Arial, sans-serif;
-            font-size: 14px;
-            z-index: 10000;
-            transition: background-color 0.3s ease;
-        `;
-        button.addEventListener('mouseover', () => { button.style.backgroundColor = '#F57C00'; });
-        button.addEventListener('mouseout', () => { button.style.backgroundColor = '#FF9800'; });
+        styleBarButton(button, '#FF9800', '#F57C00');
         button.addEventListener('click', mergeStorages);
-        document.body.appendChild(button);
+        ensureButtonBar().appendChild(button);
     }
 
     /**
@@ -993,25 +996,9 @@
     function addScanButton() {
         const button = document.createElement('button');
         button.textContent = 'Scan';
-        button.style.cssText = `
-            position: fixed;
-            bottom: 28px;
-            right: 228px;
-            padding: 10px 15px;
-            background-color: #9C27B0;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-family: Arial, sans-serif;
-            font-size: 14px;
-            z-index: 10000;
-            transition: background-color 0.3s ease;
-        `;
-        button.addEventListener('mouseover', () => { button.style.backgroundColor = '#7B1FA2'; });
-        button.addEventListener('mouseout', () => { button.style.backgroundColor = '#9C27B0'; });
+        styleBarButton(button, '#9C27B0', '#7B1FA2');
         button.addEventListener('click', scanAndCollect);
-        document.body.appendChild(button);
+        ensureButtonBar().appendChild(button);
     }
 
     /**
@@ -1023,25 +1010,9 @@
     function addWipeButton() {
         const button = document.createElement('button');
         button.textContent = 'Wipe';
-        button.style.cssText = `
-            position: fixed;
-            bottom: 28px;
-            right: 306px;
-            padding: 10px 15px;
-            background-color: #E53935;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-family: Arial, sans-serif;
-            font-size: 14px;
-            z-index: 10000;
-            transition: background-color 0.3s ease;
-        `;
-        button.addEventListener('mouseover', () => { button.style.backgroundColor = '#C62828'; });
-        button.addEventListener('mouseout', () => { button.style.backgroundColor = '#E53935'; });
+        styleBarButton(button, '#E53935', '#C62828');
         button.addEventListener('click', wipeChineseCharacters);
-        document.body.appendChild(button);
+        ensureButtonBar().appendChild(button);
     }
 
     /**
