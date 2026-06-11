@@ -530,6 +530,10 @@
                 <input type="range" id="stv-budget-slider" min="0" max="60" step="1" value="${db.settings.budget}">
             </label>
             <div class="stv-panel-row" id="stv-panel-stats"></div>
+            <div class="stv-panel-row stv-manual-row">
+                <input type="text" id="stv-manual-input" placeholder="Thêm chữ/cụm Trung..." autocomplete="off">
+                <button id="stv-manual-btn" title="Thêm vào DB học">Thêm</button>
+            </div>
             <label class="stv-panel-row">
                 <input type="checkbox" id="stv-known-toggle" ${db.settings.showKnown ? 'checked' : ''}>
                 Hiện cụm đã thuộc
@@ -557,6 +561,24 @@
             saveDB(db2);
             showNotification(`Budget: ${slider.value} cụm — hiệu lực từ chương kế`, 'info');
             updatePanelStats();
+        });
+
+        const manualInput = panelEl.querySelector('#stv-manual-input');
+        const submitManual = () => {
+            const value = manualInput.value.trim();
+            if (!value) return;
+            const added = learnAddPhrase(value);
+            manualInput.value = '';
+            updatePanelStats();
+            refreshNewHighlight();
+            const singleNote = !isMaterializable(value) ? ' (1 ký tự: chỉ Anki + nhận diện)' : '';
+            showNotification(added
+                ? `Đã thêm "${value}"${singleNote} — hiệu lực từ chương kế`
+                : `"${value}" đã có trong kho`, added ? 'success' : 'info');
+        };
+        panelEl.querySelector('#stv-manual-btn').addEventListener('click', submitManual);
+        manualInput.addEventListener('keydown', e => {
+            if (e.key === 'Enter') { e.preventDefault(); submitManual(); }
         });
 
         panelEl.querySelector('#stv-known-toggle').addEventListener('change', e => {
@@ -789,6 +811,23 @@
                 cursor: pointer;
             }
             #stv-learn-panel label.stv-panel-row { cursor: pointer; }
+            #stv-learn-panel .stv-manual-row { display: flex; gap: 6px; }
+            #stv-learn-panel #stv-manual-input {
+                all: revert;
+                flex: 1;
+                min-width: 0;
+                padding: 6px 8px;
+                font-size: 14px;
+                border: 1px solid #BDBDBD;
+                border-radius: 4px;
+                background: #fff;
+                color: #212121;
+            }
+            #stv-learn-panel #stv-manual-btn {
+                background: #00897B; color: #fff; border: none;
+                border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 12px;
+            }
+            #stv-learn-panel #stv-manual-btn:hover { background: #00695C; }
             #stv-learn-panel .stv-panel-buttons { display: flex; gap: 6px; }
             #stv-learn-panel .stv-panel-buttons button {
                 flex: 1; background: #00897B; color: #fff; border: none;
@@ -814,6 +853,12 @@
                 outline: 3px solid #FFD54F !important;
                 outline-offset: 2px;
                 transition: outline-color 0.3s ease;
+            }
+            i.stv-new-highlight {
+                background-color: #FFF59D !important;
+                color: #000 !important;
+                outline: 1px dashed #F9A825 !important;
+                border-radius: 2px;
             }
             @media (max-width: 480px) {
                 #stv-learn-panel {
@@ -1029,6 +1074,108 @@
         button.textContent = 'Scan';
         styleBarButton(button, '#9C27B0', '#7B1FA2');
         button.addEventListener('click', scanAndCollect);
+        ensureButtonBar().appendChild(button);
+    }
+
+    /**
+     * Add a phrase/character to the learning DB. Returns true if newly
+     * added. Harvests Hán-Việt + meaning from any matching rendered
+     * segment so manual adds get enriched immediately.
+     */
+    function learnAddPhrase(phrase) {
+        phrase = (phrase || '').trim();
+        if (!phrase) return false;
+        const db = loadDB();
+        const added = dbAddPhrase(db, phrase);
+        // Enrich from a rendered segment if present.
+        const seg = [...document.querySelectorAll('i[t]')].find(el =>
+            (el.getAttribute('t') || '').trim() === phrase
+        );
+        if (seg) {
+            const info = db.phrases[phrase];
+            const h = (seg.getAttribute('h') || '').trim();
+            const v = (seg.getAttribute('v') || '').trim();
+            if (h && !info.hv) info.hv = h;
+            if (v && !info.meaning) info.meaning = v;
+        }
+        saveDB(db);
+        return added;
+    }
+
+    /**
+     * "Mới" toggle: highlight every <i t> segment whose phrase is NOT yet
+     * in the learning DB (or stored as $X=X) — i.e. material you haven't
+     * collected. While active, clicking a highlighted segment adds it.
+     * The complement of Scan: Scan grabs all-known phrases automatically;
+     * this surfaces phrases containing new characters to add by hand.
+     */
+    let newHighlightActive = false;
+
+    function collectedSet() {
+        const db = loadDB();
+        const collected = new Set(Object.keys(db.phrases));
+        const storyKey = getLocalStorageKeyFromURL();
+        [storyKey, GLOBAL_KEY].forEach(key => {
+            if (!key) return;
+            parseStorageEntries(localStorage.getItem(key)).forEach(entry => {
+                if (entry.isSelf && entry.left) collected.add(entry.left);
+            });
+        });
+        return collected;
+    }
+
+    function applyNewHighlight() {
+        const collected = collectedSet();
+        // Characters you already have, from every collected phrase.
+        const knownChars = new Set();
+        collected.forEach(p => {
+            for (const ch of p) knownChars.add(ch);
+        });
+
+        let count = 0;
+        document.querySelectorAll('i[t]').forEach(el => {
+            const t = (el.getAttribute('t') || '').trim();
+            // Only Chinese segments, not already collected.
+            if (!t || collected.has(t)) return;
+            if (!/[一-鿿]/.test(t)) return;
+            // Highlight ONLY phrases with a character you don't have yet.
+            // All-known-character phrases are Scan's job, not yours.
+            if ([...t].every(ch => knownChars.has(ch))) return;
+            el.classList.add('stv-new-highlight');
+            count++;
+        });
+        return count;
+    }
+
+    function clearNewHighlight() {
+        document.querySelectorAll('i.stv-new-highlight').forEach(el =>
+            el.classList.remove('stv-new-highlight')
+        );
+    }
+
+    function refreshNewHighlight() {
+        if (!newHighlightActive) return;
+        clearNewHighlight();
+        applyNewHighlight();
+    }
+
+    function addNewHighlightButton() {
+        const button = document.createElement('button');
+        button.textContent = 'Mới';
+        styleBarButton(button, '#5C6BC0', '#3F51B5');
+        button.addEventListener('click', () => {
+            newHighlightActive = !newHighlightActive;
+            if (newHighlightActive) {
+                const n = applyNewHighlight();
+                button.textContent = 'Mới ✓';
+                button.style.backgroundColor = '#3949AB';
+                showNotification(`${n} cụm có chữ mới (chưa có trong kho)`, 'info');
+            } else {
+                clearNewHighlight();
+                button.textContent = 'Mới';
+                button.style.backgroundColor = '#5C6BC0';
+            }
+        });
         ensureButtonBar().appendChild(button);
     }
 
@@ -1439,6 +1586,7 @@
             injectStyles();
             addRunButton();
             addScanButton();
+            addNewHighlightButton();
             addLearnButton();
             addKeyboardShortcut();
             setupTooltipDelegation();
