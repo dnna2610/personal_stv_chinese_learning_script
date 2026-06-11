@@ -1602,9 +1602,9 @@
      *  - is made entirely of characters you already know (every char
      *    appears in some collected phrase).
      * Single-character segments get a rescue pass: a known single char is
-     * merged with an adjacent all-known segment to form a candidate
-     * (我 + 就是 → 我就是, or 就 + 是 → 就是), preferring the following
-     * segment, falling back to the preceding one.
+     * merged with its adjacent all-known segments to form candidates —
+     * BOTH directions are tried (prev+char AND char+next), so 你 between
+     * 看到 and 了 yields both 看到你 and 你了 if each is all-known.
      * New phrases enter the learning queue; the budget decides when they
      * actually render as Chinese (from the next chapter load).
      */
@@ -1648,29 +1648,29 @@
             if (allKnown(t)) candidates.add(t);
         });
 
-        // Pass 2: rescue known single-char segments by merging with an
-        // adjacent known segment (next preferred, then previous).
+        // Pass 2: rescue known single-char segments by merging with their
+        // adjacent known segments — BOTH the preceding and following one.
         const prevOf = new Map();
         segments.forEach(el => {
             const next = nextAdjacentSegment(el);
             if (next) prevOf.set(next, el);
         });
 
+        const tryMerge = merged => {
+            if (!merged || collected.has(merged) || candidates.has(merged)) return;
+            if ([...merged].length > MAX_MERGED_CHARS || !allKnown(merged)) return;
+            candidates.add(merged);
+        };
+
         segments.forEach(el => {
             const t = segText(el);
             if ([...t].length !== 1 || !knownChars.has(t)) return;
 
-            const tryMerge = merged => {
-                if (!merged || collected.has(merged) || candidates.has(merged)) return false;
-                if ([...merged].length > MAX_MERGED_CHARS || !allKnown(merged)) return false;
-                candidates.add(merged);
-                return true;
-            };
-
-            const next = nextAdjacentSegment(el);
-            if (next && tryMerge(t + segText(next))) return;
+            // Try both neighbours independently (not next-or-prev).
             const prev = prevOf.get(el);
             if (prev) tryMerge(segText(prev) + t);
+            const next = nextAdjacentSegment(el);
+            if (next) tryMerge(t + segText(next));
         });
 
         if (candidates.size === 0) {
