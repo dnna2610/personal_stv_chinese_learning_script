@@ -1058,6 +1058,19 @@
         if (!panelEl) return;
         const db = loadDB();
         const { known, learningTotal, singles } = selectActivePhrases(db);
+
+        // Distinct characters across all collected phrases — the real
+        // reading-ability unit. Track total vs. those in "known" phrases.
+        const allChars = new Set();
+        const knownChars = new Set();
+        Object.entries(db.phrases).forEach(([phrase, info]) => {
+            for (const ch of phrase) {
+                if (!/[一-鿿]/.test(ch)) continue;
+                allChars.add(ch);
+                if (info.status === 'known') knownChars.add(ch);
+            }
+        });
+
         const statsEl = panelEl.querySelector('#stv-panel-stats');
         if (statsEl) {
             // "Chương này": learning phrases present in this chapter and how
@@ -1069,6 +1082,7 @@
                 `Đang học: <b>${learningTotal}</b>` +
                 ` · Đã thuộc: <b>${known.length}</b>` +
                 (singles ? ` · 1 ký tự: <b>${singles}</b> (chỉ Anki)` : '') +
+                `<br>Ký tự khác nhau: <b>${allChars.size}</b> (đã thuộc ${knownChars.size})` +
                 chapterInfo;
         }
     }
