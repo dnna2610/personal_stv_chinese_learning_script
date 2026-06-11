@@ -61,6 +61,7 @@
                     db.settings = db.settings || {};
                     if (typeof db.settings.budget !== 'number') db.settings.budget = DEFAULT_BUDGET;
                     if (typeof db.settings.autoApply !== 'boolean') db.settings.autoApply = true;
+                    if (typeof db.settings.showKnown !== 'boolean') db.settings.showKnown = true;
                     if (!Array.isArray(db.settings.disabledStories)) db.settings.disabledStories = [];
                     return db;
                 }
@@ -70,7 +71,7 @@
         }
         return {
             version: 1,
-            settings: { budget: DEFAULT_BUDGET, autoApply: true, disabledStories: [] },
+            settings: { budget: DEFAULT_BUDGET, autoApply: true, showKnown: true, disabledStories: [] },
             phrases: {}
         };
     }
@@ -200,7 +201,10 @@
         const imported = importFromNameStorages(db);
 
         const { known, learningActive, learningTotal } = selectActivePhrases(db);
-        const active = new Set([...known, ...learningActive]);
+        const active = new Set([
+            ...(db.settings.showKnown ? known : []),
+            ...learningActive
+        ]);
 
         const entries = parseStorageEntries(localStorage.getItem(storyKey));
         // Keep real translations, and keep single-char $X=X the user added
@@ -527,6 +531,10 @@
             </label>
             <div class="stv-panel-row" id="stv-panel-stats"></div>
             <label class="stv-panel-row">
+                <input type="checkbox" id="stv-known-toggle" ${db.settings.showKnown ? 'checked' : ''}>
+                Hiện cụm đã thuộc
+            </label>
+            <label class="stv-panel-row">
                 <input type="checkbox" id="stv-story-toggle" ${storyDisabled ? '' : 'checked'}>
                 Bật học cho truyện này
             </label>
@@ -551,6 +559,16 @@
             updatePanelStats();
         });
 
+        panelEl.querySelector('#stv-known-toggle').addEventListener('change', e => {
+            const db2 = loadDB();
+            db2.settings.showKnown = e.target.checked;
+            saveDB(db2);
+            showNotification(e.target.checked
+                ? 'Cụm đã thuộc sẽ hiển thị (từ chương kế)'
+                : 'Ẩn cụm đã thuộc — slider 0 = tắt hẳn (từ chương kế)', 'info');
+            updatePanelStats();
+        });
+
         panelEl.querySelector('#stv-story-toggle').addEventListener('change', e => {
             const key = getLocalStorageKeyFromURL();
             if (!key) return;
@@ -560,11 +578,19 @@
                 db2.settings.disabledStories = list.filter(k => k !== key);
             } else if (!list.includes(key)) {
                 list.push(key);
+                // Strip the materialized $X=X entries from this story so the
+                // Chinese actually disappears (from the next chapter load).
+                // Manual single-char keeps and real translations stay.
+                const entries = parseStorageEntries(localStorage.getItem(key));
+                const keep = entries.filter(en =>
+                    !en.isSelf || (en.left && !isMaterializable(en.left))
+                );
+                localStorage.setItem(key, keep.length ? keep.map(en => en.raw).join('~//~') + '~//~' : '');
             }
             saveDB(db2);
             showNotification(e.target.checked
                 ? 'Bật học cho truyện này (từ chương kế)'
-                : 'Tắt học cho truyện này — dùng Wipe để xoá chữ đang hiển thị', 'info');
+                : 'Tắt học cho truyện này — chữ Trung sẽ biến mất từ chương kế', 'info');
         });
 
         panelEl.querySelector('#stv-panel-close').addEventListener('click', togglePanel);
@@ -747,6 +773,22 @@
             #stv-learn-panel #stv-panel-close { cursor: pointer; color: #757575; }
             #stv-learn-panel .stv-panel-row { display: block; margin-bottom: 8px; }
             #stv-learn-panel input[type=range] { width: 100%; }
+            /* The site hides/restyles native checkboxes — force ours back. */
+            #stv-learn-panel input[type=checkbox] {
+                all: revert;
+                appearance: auto;
+                -webkit-appearance: checkbox;
+                display: inline-block;
+                width: 16px;
+                height: 16px;
+                margin: 0 8px 0 0;
+                opacity: 1;
+                position: static;
+                vertical-align: middle;
+                accent-color: #00897B;
+                cursor: pointer;
+            }
+            #stv-learn-panel label.stv-panel-row { cursor: pointer; }
             #stv-learn-panel .stv-panel-buttons { display: flex; gap: 6px; }
             #stv-learn-panel .stv-panel-buttons button {
                 flex: 1; background: #00897B; color: #fff; border: none;
@@ -978,17 +1020,6 @@
     }
 
     /**
-     * Create and add merge button to the page
-     */
-    function addMergeButton() {
-        const button = document.createElement('button');
-        button.textContent = 'Merge';
-        styleBarButton(button, '#FF9800', '#F57C00');
-        button.addEventListener('click', mergeStorages);
-        ensureButtonBar().appendChild(button);
-    }
-
-    /**
      * Create and add the scan button. Scans the rendered chapter and
      * auto-collects candidate phrases into the learning DB (see
      * scanAndCollect).
@@ -998,20 +1029,6 @@
         button.textContent = 'Scan';
         styleBarButton(button, '#9C27B0', '#7B1FA2');
         button.addEventListener('click', scanAndCollect);
-        ensureButtonBar().appendChild(button);
-    }
-
-    /**
-     * Create and add the "Wipe" button, positioned to the left of Scan.
-     * Removes all $X=X entries from the current story's storage AND
-     * disables auto-apply for this story (otherwise the learning system
-     * would re-add the active subset on the next chapter load).
-     */
-    function addWipeButton() {
-        const button = document.createElement('button');
-        button.textContent = 'Wipe';
-        styleBarButton(button, '#E53935', '#C62828');
-        button.addEventListener('click', wipeChineseCharacters);
         ensureButtonBar().appendChild(button);
     }
 
@@ -1131,118 +1148,6 @@
         // Harvest hv/meaning for the new phrases from this chapter's
         // <i h= v=> attributes right away.
         annotateRenderedPhrases();
-    }
-
-    /**
-     * Remove all Chinese-character entries ("$X=X") from the current
-     * story's localStorage, keeping every other entry. Also disables
-     * auto-apply for this story so they stay gone.
-     */
-    function wipeChineseCharacters() {
-        const storageKey = getLocalStorageKeyFromURL();
-        if (!storageKey) {
-            showNotification('Could not determine localStorage key from URL', 'error');
-            return;
-        }
-
-        const currentValue = localStorage.getItem(storageKey);
-        if (currentValue === null) {
-            showNotification(`localStorage key "${storageKey}" not found`, 'error');
-            return;
-        }
-
-        const entries = currentValue.split('~//~').filter(entry => entry.trim());
-        const keptEntries = entries.filter(entry => {
-            const match = entry.match(/^\$(.+)=(.+)$/);
-            if (!match) return true;
-            return match[1].trim() !== match[2].trim();
-        });
-
-        const removedCount = entries.length - keptEntries.length;
-        if (removedCount === 0) {
-            showNotification('No Chinese characters to wipe in this story', 'info');
-            return;
-        }
-
-        if (!window.confirm(`Remove ${removedCount} Chinese character entr${removedCount === 1 ? 'y' : 'ies'} from this story? Learning auto-apply will be turned off for this story too.`)) {
-            return;
-        }
-
-        const newValue = keptEntries.length > 0 ? keptEntries.join('~//~') + '~//~' : '';
-        localStorage.setItem(storageKey, newValue);
-
-        // Stop the learning system from re-adding them next chapter.
-        const db = loadDB();
-        if (!db.settings.disabledStories.includes(storageKey)) {
-            db.settings.disabledStories.push(storageKey);
-            saveDB(db);
-        }
-
-        showNotification(`Wiped ${removedCount} entr${removedCount === 1 ? 'y' : 'ies'}; learning off for this story (re-enable in Học panel)`, 'success');
-    }
-
-    /**
-     * Merge characters between global and story storage
-     */
-    function mergeStorages() {
-        const storageKey = getLocalStorageKeyFromURL();
-        if (!storageKey) {
-            showNotification('Could not determine localStorage key from URL', 'error');
-            return;
-        }
-
-        const globalKey = GLOBAL_KEY;
-        let globalValue = localStorage.getItem(globalKey) || '';
-        let storyValue = localStorage.getItem(storageKey) || '';
-
-        const globalEntries = globalValue.split('~//~').filter(entry => entry.trim());
-        const storyEntries = storyValue.split('~//~').filter(entry => entry.trim());
-        const globalSet = new Set(globalEntries);
-        const storySet = new Set(storyEntries);
-
-        let addedToGlobal = 0;
-        let addedToStory = 0;
-
-        storyEntries.forEach(entry => {
-            if (!globalSet.has(entry)) {
-                const match = entry.match(/^\$(.+)=(.+)$/);
-                if (match && match[1].trim() === match[2].trim()) {
-                    globalEntries.push(entry);
-                    addedToGlobal++;
-                }
-            }
-        });
-
-        globalEntries.forEach(entry => {
-            if (!storySet.has(entry)) {
-                const match = entry.match(/^\$(.+)=(.+)$/);
-                if (match && [...match[1].trim()].length <= 1) return;
-                storyEntries.push(entry);
-                addedToStory++;
-            }
-        });
-
-        const sortByChineseLength = (a, b) => {
-            const aMatch = a.match(/^\$(.+)=(.+)$/);
-            const bMatch = b.match(/^\$(.+)=(.+)$/);
-            if (aMatch && bMatch) return aMatch[1].length - bMatch[1].length;
-            return a.length - b.length;
-        };
-        globalEntries.sort(sortByChineseLength);
-        storyEntries.sort(sortByChineseLength);
-
-        const uniqueGlobalEntries = [...new Set(globalEntries)];
-        const uniqueStoryEntries = [...new Set(storyEntries)];
-
-        localStorage.setItem(globalKey, uniqueGlobalEntries.length ? uniqueGlobalEntries.join('~//~') + '~//~' : '');
-        localStorage.setItem(storageKey, uniqueStoryEntries.length ? uniqueStoryEntries.join('~//~') + '~//~' : '');
-
-        // Keep the learning DB in sync with anything merged.
-        const db = loadDB();
-        const n = importFromNameStorages(db);
-        saveDB(db);
-
-        showNotification(`Merged! +${addedToGlobal} global, +${addedToStory} story${n ? `, +${n} learn DB` : ''}`, 'success');
     }
 
     /**
@@ -1533,9 +1438,7 @@
         const start = () => {
             injectStyles();
             addRunButton();
-            addMergeButton();
             addScanButton();
-            addWipeButton();
             addLearnButton();
             addKeyboardShortcut();
             setupTooltipDelegation();
