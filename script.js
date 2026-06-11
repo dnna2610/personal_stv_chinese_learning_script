@@ -7,7 +7,6 @@
 // @match        https://sangtacviet.com/truyen/*/*
 // @match        https://sangtacviet.vip/truyen/*/*
 // @match        https://sangtacviet.vn/truyen/*/*
-// @include      /^https?:\/\/sangtacviet\.[a-z]+\/truyen\/.*$/
 // @require      https://cdn.jsdelivr.net/npm/pinyin@4.0.0/lib/umd/pinyin.min.js
 // @run-at       document-start
 // @grant        none
@@ -245,6 +244,10 @@
     // A kept phrase renders with text equal to its t attribute.
     // =====================================================================
 
+    // Distinct phrases rendered as Chinese in the current chapter,
+    // with occurrence counts — feeds the panel's chapter overview.
+    let lastChapterCounts = {};
+
     function annotateRenderedPhrases() {
         const db = loadDB();
         const counts = {};
@@ -282,7 +285,9 @@
         }
 
         if (dirty) saveDB(db);
+        lastChapterCounts = counts;
         updatePanelStats(Object.keys(counts).length);
+        updateChapterOverview();
     }
 
     /**
@@ -529,6 +534,7 @@
                 <button id="stv-import-btn" title="Nhập mọi $X=X từ kho cũ vào DB học">Nhập từ kho cũ</button>
                 <button id="stv-export-btn" title="Copy TSV (chữ, pinyin, Hán Việt, nghĩa) để import vào Anki">Xuất Anki</button>
             </div>
+            <div class="stv-panel-row" id="stv-chapter-overview"></div>
             <div class="stv-panel-hint">Thay đổi có hiệu lực từ chương kế (như cơ chế name của site). Mệt thì kéo slider xuống.</div>
         `;
         document.body.appendChild(panelEl);
@@ -571,8 +577,62 @@
         });
         panelEl.querySelector('#stv-export-btn').addEventListener('click', exportAnkiTSV);
 
+        // Chapter overview: tap a phrase chip to scroll to its first
+        // occurrence and flash it.
+        panelEl.querySelector('#stv-chapter-overview').addEventListener('click', e => {
+            const chip = e.target.closest('.stv-chip');
+            if (!chip) return;
+            const phrase = chip.dataset.phrase;
+            const target = [...document.querySelectorAll('i[t]')].find(el =>
+                (el.getAttribute('t') || '').trim() === phrase &&
+                el.textContent.trim() === phrase
+            );
+            if (!target) return;
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            target.classList.add('stv-flash');
+            setTimeout(() => target.classList.remove('stv-flash'), 2000);
+        });
+
         updatePanelStats();
+        updateChapterOverview();
         return panelEl;
+    }
+
+    /**
+     * Render the per-chapter overview: how many phrases the budget applied
+     * to this chapter, occurrence totals, and a chip per distinct phrase
+     * (purple border = learning, teal = known; tap to jump to it).
+     */
+    function updateChapterOverview() {
+        if (!panelEl) return;
+        const container = panelEl.querySelector('#stv-chapter-overview');
+        if (!container) return;
+
+        const phrases = Object.keys(lastChapterCounts);
+        if (!phrases.length) {
+            container.innerHTML = '<div class="stv-overview-title">Chương này: chưa có cụm nào hiển thị</div>';
+            return;
+        }
+
+        const db = loadDB();
+        const totalOccurrences = Object.values(lastChapterCounts).reduce((a, b) => a + b, 0);
+        let learningCount = 0;
+        let knownCount = 0;
+
+        // Most frequent first; learning before known within equal counts.
+        phrases.sort((a, b) => lastChapterCounts[b] - lastChapterCounts[a]);
+
+        const chips = phrases.map(p => {
+            const info = db.phrases[p];
+            const isKnown = info && info.status === 'known';
+            if (isKnown) knownCount++; else learningCount++;
+            return `<span class="stv-chip ${isKnown ? 'stv-chip-known' : 'stv-chip-learning'}" data-phrase="${p}" title="Bấm để nhảy tới">${p} <small>×${lastChapterCounts[p]}</small></span>`;
+        }).join('');
+
+        container.innerHTML = `
+            <div class="stv-overview-title">Chương này: <b>${phrases.length}</b> cụm (${learningCount} đang học, ${knownCount} đã thuộc) · <b>${totalOccurrences}</b> lần xuất hiện</div>
+            <div class="stv-overview-chips">${chips}</div>
+        `;
     }
 
     function updatePanelStats(annotatedCount) {
@@ -710,6 +770,25 @@
             }
             #stv-learn-panel .stv-panel-buttons button:hover { background: #00695C; }
             #stv-learn-panel .stv-panel-hint { color: #757575; font-size: 11px; }
+            #stv-learn-panel .stv-overview-title { font-size: 12px; margin-bottom: 4px; }
+            #stv-learn-panel .stv-overview-chips {
+                max-height: 140px; overflow-y: auto;
+                display: flex; flex-wrap: wrap; gap: 4px;
+            }
+            #stv-learn-panel .stv-chip {
+                display: inline-block; padding: 2px 7px; border-radius: 10px;
+                background: #fff; cursor: pointer; font-size: 14px;
+                border: 1.5px solid #9C27B0;
+            }
+            #stv-learn-panel .stv-chip small { color: #757575; font-size: 10px; }
+            #stv-learn-panel .stv-chip.stv-chip-known { border-color: #00897B; }
+            #stv-learn-panel .stv-chip:hover { background: #F3E5F5; }
+            #stv-learn-panel .stv-chip.stv-chip-known:hover { background: #E0F2F1; }
+            i.stv-flash {
+                outline: 3px solid #FFD54F !important;
+                outline-offset: 2px;
+                transition: outline-color 0.3s ease;
+            }
         `;
         document.head.appendChild(style);
     }
@@ -907,12 +986,11 @@
     }
 
     /**
-     * Create and add scan toggle button to the page.
-     * When active, highlights all <i t="..."> segments whose Chinese text
-     * matches a "$X=X" entry in the current story's localStorage.
+     * Create and add the scan button. Scans the rendered chapter and
+     * auto-collects candidate phrases into the learning DB (see
+     * scanAndCollect).
      */
     function addScanButton() {
-        let isScanActive = false;
         const button = document.createElement('button');
         button.textContent = 'Scan';
         button.style.cssText = `
@@ -930,26 +1008,9 @@
             z-index: 10000;
             transition: background-color 0.3s ease;
         `;
-        button.addEventListener('mouseover', () => {
-            button.style.backgroundColor = isScanActive ? '#388E3C' : '#7B1FA2';
-        });
-        button.addEventListener('mouseout', () => {
-            button.style.backgroundColor = isScanActive ? '#4CAF50' : '#9C27B0';
-        });
-        button.addEventListener('click', () => {
-            if (!isScanActive) {
-                const count = activateScanHighlight();
-                if (count === null) return;
-                isScanActive = true;
-                button.textContent = 'Scan ✓';
-                button.style.backgroundColor = '#4CAF50';
-            } else {
-                deactivateScanHighlight();
-                isScanActive = false;
-                button.textContent = 'Scan';
-                button.style.backgroundColor = '#9C27B0';
-            }
-        });
+        button.addEventListener('mouseover', () => { button.style.backgroundColor = '#7B1FA2'; });
+        button.addEventListener('mouseout', () => { button.style.backgroundColor = '#9C27B0'; });
+        button.addEventListener('click', scanAndCollect);
         document.body.appendChild(button);
     }
 
@@ -984,79 +1045,121 @@
     }
 
     /**
-     * Highlight every <i t="..."> whose characters are all known —
-     * from $X=X entries in this story OR from the learning DB (the budget
-     * may have rotated entries out of story storage, but you still know them).
+     * Find the next <i t> segment that is adjacent in the original Chinese:
+     * only whitespace-only text nodes may sit between the two elements.
+     * Punctuation, <br>, or any other element breaks adjacency (those exist
+     * in the source text too).
      */
-    function activateScanHighlight() {
+    function nextAdjacentSegment(el) {
+        let n = el.nextSibling;
+        while (n) {
+            if (n.nodeType === Node.TEXT_NODE && !n.textContent.trim()) {
+                n = n.nextSibling;
+                continue;
+            }
+            if (n.nodeType === Node.ELEMENT_NODE && n.matches('i[t]')) return n;
+            return null;
+        }
+        return null;
+    }
+
+    /**
+     * Scan the rendered chapter for candidate phrases and auto-collect
+     * them into the learning DB. A candidate is a segment whose phrase:
+     *  - is at least 2 characters (single chars break the MT),
+     *  - is NOT already collected (learn DB / story / global $X=X),
+     *  - is made entirely of characters you already know (every char
+     *    appears in some collected phrase).
+     * Single-character segments get a rescue pass: a known single char is
+     * merged with an adjacent all-known segment to form a candidate
+     * (我 + 就是 → 我就是, or 就 + 是 → 就是), preferring the following
+     * segment, falling back to the preceding one.
+     * New phrases enter the learning queue; the budget decides when they
+     * actually render as Chinese (from the next chapter load).
+     */
+    function scanAndCollect() {
         const storageKey = getLocalStorageKeyFromURL();
         if (!storageKey) {
             showNotification('Could not determine localStorage key from URL', 'error');
-            return null;
+            return;
         }
 
-        const knownChars = new Set();
-        parseStorageEntries(localStorage.getItem(storageKey)).forEach(entry => {
-            if (entry.isSelf && entry.left) {
-                for (const ch of entry.left) knownChars.add(ch);
-            }
-        });
         const db = loadDB();
-        Object.keys(db.phrases).forEach(p => {
+        const collected = new Set(Object.keys(db.phrases));
+        [storageKey, GLOBAL_KEY].forEach(key => {
+            parseStorageEntries(localStorage.getItem(key)).forEach(entry => {
+                if (entry.isSelf && entry.left) collected.add(entry.left);
+            });
+        });
+
+        const knownChars = new Set();
+        collected.forEach(p => {
             for (const ch of p) knownChars.add(ch);
         });
 
         if (knownChars.size === 0) {
-            showNotification('No known characters in this story yet', 'info');
-            return null;
+            showNotification('No known characters yet — add some phrases first', 'info');
+            return;
         }
 
-        let count = 0;
-        document.querySelectorAll('i[t]').forEach(el => {
-            const t = (el.getAttribute('t') || '').trim();
-            if (!t) return;
-            const chars = [...t];
-            if (chars.length === 0) return;
-            if (chars.every(ch => knownChars.has(ch))) {
-                el.style.backgroundColor = pickHighlightColor(el);
-                el.setAttribute('data-scan-highlighted', '1');
-                count++;
-            }
+        const segText = el => (el.getAttribute('t') || '').trim();
+        const allKnown = t => t && [...t].every(ch => knownChars.has(ch));
+        // Merged phrases longer than this are clauses, not vocabulary.
+        const MAX_MERGED_CHARS = 6;
+
+        const candidates = new Set();
+        const segments = [...document.querySelectorAll('i[t]')];
+
+        // Pass 1: whole segments that qualify on their own.
+        segments.forEach(el => {
+            const t = segText(el);
+            if (!t || collected.has(t) || !isMaterializable(t)) return;
+            if (allKnown(t)) candidates.add(t);
         });
 
-        showNotification(`Highlighted ${count} known segment(s)`, 'success');
-        return count;
-    }
+        // Pass 2: rescue known single-char segments by merging with an
+        // adjacent known segment (next preferred, then previous).
+        const prevOf = new Map();
+        segments.forEach(el => {
+            const next = nextAdjacentSegment(el);
+            if (next) prevOf.set(next, el);
+        });
 
-    /**
-     * Pick a highlight background color that contrasts with the element's
-     * current text color. Day mode (dark text) gets a vivid purple, night
-     * mode (light text) gets a deeper indigo so white text stays readable.
-     */
-    function pickHighlightColor(el) {
-        const color = getComputedStyle(el).color;
-        const m = color.match(/\d+(\.\d+)?/g);
-        if (!m || m.length < 3) {
-            return '#893bff';
+        segments.forEach(el => {
+            const t = segText(el);
+            if ([...t].length !== 1 || !knownChars.has(t)) return;
+
+            const tryMerge = merged => {
+                if (!merged || collected.has(merged) || candidates.has(merged)) return false;
+                if ([...merged].length > MAX_MERGED_CHARS || !allKnown(merged)) return false;
+                candidates.add(merged);
+                return true;
+            };
+
+            const next = nextAdjacentSegment(el);
+            if (next && tryMerge(t + segText(next))) return;
+            const prev = prevOf.get(el);
+            if (prev) tryMerge(segText(prev) + t);
+        });
+
+        if (candidates.size === 0) {
+            showNotification('Không tìm thấy cụm mới nào (biết hết chữ) trong chương này', 'info');
+            return;
         }
-        const r = parseFloat(m[0]);
-        const g = parseFloat(m[1]);
-        const b = parseFloat(m[2]);
-        // Perceived luminance (0..1). >0.5 = light text → night mode.
-        const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-        return luminance > 0.5 ? '#311B92' : '#893bff';
-    }
 
-    /**
-     * Remove all highlights applied by activateScanHighlight().
-     */
-    function deactivateScanHighlight() {
-        const nodes = document.querySelectorAll('i[data-scan-highlighted="1"]');
-        nodes.forEach(el => {
-            el.style.backgroundColor = '';
-            el.removeAttribute('data-scan-highlighted');
+        let added = 0;
+        candidates.forEach(p => {
+            if (dbAddPhrase(db, p)) added++;
         });
-        return nodes.length;
+        saveDB(db);
+        updatePanelStats();
+
+        console.log('STV-Learn: scan collected', [...candidates].join(', '));
+        showNotification(`Đã thêm ${added} cụm mới vào DB học — hiệu lực từ chương kế`, 'success');
+
+        // Harvest hv/meaning for the new phrases from this chapter's
+        // <i h= v=> attributes right away.
+        annotateRenderedPhrases();
     }
 
     /**
