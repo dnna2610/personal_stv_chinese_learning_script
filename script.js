@@ -151,6 +151,18 @@
      * within a session — that churn is intentional spaced exposure.
      * Single-character phrases are excluded (see isMaterializable).
      */
+    // SRS ordering: never-seen first, then least-recently-seen, then fewest
+    // exposures. Used to prioritize which learning phrases fill the budget.
+    function srsCompare(db) {
+        return (a, b) => {
+            const ia = db.phrases[a], ib = db.phrases[b];
+            const seenA = ia.lastSeen || '';
+            const seenB = ib.lastSeen || '';
+            if (seenA !== seenB) return seenA < seenB ? -1 : 1; // '' (never) first
+            return ia.exposures - ib.exposures;
+        };
+    }
+
     function selectActivePhrases(db) {
         const known = [];
         const learning = [];
@@ -161,13 +173,7 @@
             else learning.push(phrase);
         });
 
-        learning.sort((a, b) => {
-            const ia = db.phrases[a], ib = db.phrases[b];
-            const seenA = ia.lastSeen || '';
-            const seenB = ib.lastSeen || '';
-            if (seenA !== seenB) return seenA < seenB ? -1 : 1; // '' (never) first
-            return ia.exposures - ib.exposures;
-        });
+        learning.sort(srsCompare(db));
 
         return {
             known,
@@ -177,19 +183,127 @@
         };
     }
 
+    /**
+     * Reconstruct this chapter's raw Chinese text from the rendered DOM:
+     * each <i t> contributes its original Chinese (t), text nodes and <br>
+     * are preserved so phrase boundaries are real. Used to detect which
+     * collected phrases actually occur in the chapter.
+     */
+    function reconstructChapterText() {
+        const boxes = document.querySelectorAll('.contentbox');
+        const roots = boxes.length ? [...boxes] : [];
+        if (!roots.length) return '';
+        let out = '';
+        const walk = node => {
+            node.childNodes.forEach(n => {
+                if (n.nodeType === Node.TEXT_NODE) {
+                    out += n.textContent;
+                } else if (n.nodeType === Node.ELEMENT_NODE) {
+                    if (n.tagName === 'I' && n.hasAttribute('t')) out += n.getAttribute('t');
+                    else if (n.tagName === 'BR') out += '\n';
+                    else walk(n);
+                }
+            });
+        };
+        roots.forEach(walk);
+        return out;
+    }
+
+    /**
+     * Like selectActivePhrases, but restricted to phrases that actually
+     * appear in this chapter's text — so budget slots aren't wasted on
+     * phrases absent from the chapter. Returns the full active list
+     * (known + budgeted learning) plus diagnostics.
+     */
+    function selectActiveForChapter(db, text) {
+        const known = [];
+        const learning = [];
+        Object.entries(db.phrases).forEach(([phrase, info]) => {
+            if (!isMaterializable(phrase)) return;
+            if (!text.includes(phrase)) return; // present in this chapter only
+            if (info.status === 'known') known.push(phrase);
+            else learning.push(phrase);
+        });
+        learning.sort(srsCompare(db));
+        const learningActive = learning.slice(0, db.settings.budget);
+        const active = [
+            ...(db.settings.showKnown ? known : []),
+            ...learningActive
+        ];
+        return {
+            active,
+            knownPresent: known.length,
+            learningActive: learningActive.length,
+            learningPresent: learning.length
+        };
+    }
+
+    // ---- Per-chapter active-set cache -------------------------------------
+    // The site only tokenizes new keeps on a fresh chapter load, so the
+    // presence-optimized set (computed after render) is cached per chapter
+    // (keyed by URL path) and applied at the next document-start load.
+    const ACTIVE_CACHE_KEY = 'STV_ACTIVE_CACHE';
+    const ACTIVE_CACHE_MAX = 50;
+
+    function loadActiveCache() {
+        try { return JSON.parse(localStorage.getItem(ACTIVE_CACHE_KEY)) || {}; }
+        catch (e) { return {}; }
+    }
+
+    function saveActiveCache(cache) {
+        const keys = Object.keys(cache);
+        if (keys.length > ACTIVE_CACHE_MAX) {
+            // FIFO eviction of oldest entries.
+            keys.slice(0, keys.length - ACTIVE_CACHE_MAX).forEach(k => delete cache[k]);
+        }
+        localStorage.setItem(ACTIVE_CACHE_KEY, JSON.stringify(cache));
+    }
+
     // =====================================================================
     // Auto-apply: materialize the active subset into the story storage.
     // Runs at document-start so the site's name loader sees the subset.
     // =====================================================================
 
+    // The active set this load actually wrote to storage (what the site
+    // rendered) — compared after render to decide if a reload would help.
+    let renderedActiveSet = new Set();
+
     /**
-     * Rewrite the current story's storage so that:
+     * Materialize a list of active phrases into the story's storage:
      *  - real translation names ($X=Y, X≠Y) are kept untouched
-     *  - $X=X entries appear only for the active phrase set
-     *  - active phrases get $X=X added even if this story never had them
-     *    (your vocabulary follows you into every story)
-     *  - an explicit translation $X=Y for an active X wins over $X=X
-     * Returns stats or null when skipped.
+     *  - single-char $X=X the user added to THIS story stay (story-local)
+     *  - $X=X entries are written for the active set (unless an explicit
+     *    translation already exists for that phrase)
+     */
+    function writeActiveToStorage(storyKey, activeList) {
+        const active = new Set(activeList);
+        const entries = parseStorageEntries(localStorage.getItem(storyKey));
+        const keep = entries.filter(e =>
+            !e.isSelf || (e.left && !isMaterializable(e.left))
+        );
+        const explicitLefts = new Set(keep.map(e => e.left).filter(Boolean));
+
+        const selfEntries = [...active]
+            .filter(p => !explicitLefts.has(p))
+            .map(p => ({ raw: `$${p}=${p}`, left: p }));
+
+        const all = [...keep, ...selfEntries];
+        all.sort((a, b) => {
+            const la = a.left ? a.left.length : a.raw.length;
+            const lb = b.left ? b.left.length : b.raw.length;
+            return la - lb;
+        });
+
+        const newValue = all.length ? all.map(e => e.raw).join('~//~') + '~//~' : '';
+        localStorage.setItem(storyKey, newValue);
+        return active;
+    }
+
+    /**
+     * At document-start, write the active set for this chapter. Prefer the
+     * presence-optimized set cached from a previous render of this exact
+     * chapter (so a reload shows phrases that are actually in the text);
+     * fall back to the global SRS pick on first-ever visit. Returns stats.
      */
     function applyBudgetToStoryStorage() {
         const storyKey = getLocalStorageKeyFromURL();
@@ -201,45 +315,87 @@
 
         // Pick up phrases added through the site dialog last chapter.
         const imported = importFromNameStorages(db);
-
-        const { known, learningActive, learningTotal } = selectActivePhrases(db);
-        const active = new Set([
-            ...(db.settings.showKnown ? known : []),
-            ...learningActive
-        ]);
-
-        const entries = parseStorageEntries(localStorage.getItem(storyKey));
-        // Keep real translations, and keep single-char $X=X the user added
-        // to THIS story deliberately (they are story-local, never propagated).
-        const keep = entries.filter(e =>
-            !e.isSelf || (e.left && !isMaterializable(e.left))
-        );
-        const explicitLefts = new Set(keep.map(e => e.left).filter(Boolean));
-
-        const selfEntries = [...active]
-            .filter(p => !explicitLefts.has(p))
-            .map(p => ({ raw: `$${p}=${p}`, left: p }));
-
-        const all = [...keep, ...selfEntries];
-        // Site convention: sort by Chinese length ascending.
-        all.sort((a, b) => {
-            const la = a.left ? a.left.length : a.raw.length;
-            const lb = b.left ? b.left.length : b.raw.length;
-            return la - lb;
-        });
-
-        const newValue = all.length ? all.map(e => e.raw).join('~//~') + '~//~' : '';
-        localStorage.setItem(storyKey, newValue);
         saveDB(db);
 
+        const cache = loadActiveCache();
+        const cached = cache[window.location.pathname];
+        let activeList;
+        let fromCache = false;
+        if (cached &&
+            cached.budget === db.settings.budget &&
+            cached.showKnown === db.settings.showKnown) {
+            activeList = cached.active;
+            fromCache = true;
+        } else {
+            // First visit (no presence info yet) — global SRS pick.
+            const { known, learningActive } = selectActivePhrases(db);
+            activeList = [
+                ...(db.settings.showKnown ? known : []),
+                ...learningActive
+            ];
+        }
+
+        renderedActiveSet = writeActiveToStorage(storyKey, activeList);
+
         return {
-            active: active.size,
-            learningActive: learningActive.length,
-            learningTotal,
-            known: known.length,
+            active: activeList.length,
+            fromCache,
             imported
         };
     }
+
+    // Notify-to-reload at most once per page load.
+    let reloadSuggested = false;
+
+    /**
+     * After the chapter renders, compute the presence-optimized active set
+     * (phrases that actually occur in this chapter), cache it for the next
+     * load, and — if a reload would surface more learning phrases than are
+     * currently shown — suggest reloading. This is the "pick the phrases we
+     * have, to the max, from this chapter" step.
+     */
+    function optimizeChapterActiveSet() {
+        const storyKey = getLocalStorageKeyFromURL();
+        if (!storyKey) return;
+        const db = loadDB();
+        if (!db.settings.autoApply || db.settings.disabledStories.includes(storyKey)) return;
+
+        const text = reconstructChapterText();
+        if (!text) return;
+
+        const { active, learningActive, learningPresent } = selectActiveForChapter(db, text);
+
+        const cache = loadActiveCache();
+        cache[window.location.pathname] = {
+            active,
+            budget: db.settings.budget,
+            showKnown: db.settings.showKnown
+        };
+        saveActiveCache(cache);
+
+        // Would reloading add learning phrases not currently rendered?
+        const newlyShowable = active.filter(p =>
+            !renderedActiveSet.has(p) &&
+            db.phrases[p] && db.phrases[p].status !== 'known'
+        ).length;
+
+        chapterLearningActive = learningActive;
+        chapterLearningPresent = learningPresent;
+        updatePanelStats(Object.keys(lastChapterCounts).length);
+
+        if (newlyShowable > 0 && !reloadSuggested) {
+            reloadSuggested = true;
+            showNotification(
+                `Chương này có ${learningPresent} cụm đang học (hiện ${learningActive}). Tải lại trang (F5) để áp dụng.`,
+                'info'
+            );
+        }
+    }
+
+    // Diagnostics for the panel: learning phrases present in / shown for
+    // the current chapter (set by optimizeChapterActiveSet).
+    let chapterLearningActive = null;
+    let chapterLearningPresent = null;
 
     // =====================================================================
     // Annotation: find kept-Chinese occurrences in the rendered chapter,
@@ -294,6 +450,7 @@
         lastChapterCounts = counts;
         updatePanelStats(Object.keys(counts).length);
         updateChapterOverview();
+        optimizeChapterActiveSet();
     }
 
     /**
@@ -900,14 +1057,19 @@
     function updatePanelStats(annotatedCount) {
         if (!panelEl) return;
         const db = loadDB();
-        const { known, learningActive, learningTotal, singles } = selectActivePhrases(db);
+        const { known, learningTotal, singles } = selectActivePhrases(db);
         const statsEl = panelEl.querySelector('#stv-panel-stats');
         if (statsEl) {
+            // "Chương này": learning phrases present in this chapter and how
+            // many fit the budget (more honest than the global budget count).
+            const chapterInfo = (chapterLearningPresent !== null)
+                ? ` · Chương này: <b>${chapterLearningActive}</b>/${chapterLearningPresent} đang học có mặt`
+                : '';
             statsEl.innerHTML =
-                `Đang học: <b>${learningTotal}</b> (hiển thị ${learningActive.length})` +
+                `Đang học: <b>${learningTotal}</b>` +
                 ` · Đã thuộc: <b>${known.length}</b>` +
                 (singles ? ` · 1 ký tự: <b>${singles}</b> (chỉ Anki)` : '') +
-                (typeof annotatedCount === 'number' ? ` · Trong chương: <b>${annotatedCount}</b>` : '');
+                chapterInfo;
         }
     }
 
@@ -1817,7 +1979,8 @@
 
             if (applyStats) {
                 showNotification(
-                    `Học: ${applyStats.active} cụm (${applyStats.learningActive}/${applyStats.learningTotal} đang học + ${applyStats.known} đã thuộc)` +
+                    `Học: áp dụng ${applyStats.active} cụm` +
+                    (applyStats.fromCache ? ' (đã tối ưu cho chương này)' : ' (lần đầu — đọc xong sẽ gợi ý tải lại)') +
                     (applyStats.imported ? ` · nhập ${applyStats.imported} mới` : ''),
                     'info'
                 );
