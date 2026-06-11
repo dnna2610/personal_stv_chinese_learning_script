@@ -32,11 +32,13 @@
     //   phrases: {
     //     "修炼": { added: "2026-06-11", status: "learning"|"known",
     //               exposures: 0, lapses: 0, lastSeen: "2026-06-11"|null,
-    //               hv: "tu luyện", meaning: "tu luyện/rèn luyện" }
+    //               hv: "tu luyện", meaning: "" }
     //   }
     // }
-    // hv/meaning are harvested automatically from the site's own
-    // <i h="..." v="..."> attributes the first time a phrase is seen.
+    // hv (Hán-Việt reading) is harvested from the site's <i h="..."> the
+    // first time a phrase is seen. The legacy `meaning` field is unused —
+    // meanings now come from CC-CEDICT (IndexedDB), since the site's v
+    // attribute is unreliable vietphrase MT.
     // =====================================================================
 
     const DB_KEY = 'STV_LEARN_DB';
@@ -263,12 +265,12 @@
             const info = db.phrases[t];
             if (!info) return;
 
-            // Harvest Hán-Việt + meaning from the site's own attributes,
-            // even for segments currently rendered as Vietnamese.
+            // Harvest only the Hán-Việt reading (h) — a deterministic
+            // phonetic mapping. The site's v "meaning" is vietphrase MT and
+            // unreliable, so meanings come from CC-CEDICT instead (see the
+            // dictionary module), not from the page.
             const h = (el.getAttribute('h') || '').trim();
-            const v = (el.getAttribute('v') || '').trim();
             if (h && !info.hv) { info.hv = h; dirty = true; }
-            if (v && !info.meaning) { info.meaning = v; dirty = true; }
 
             if (el.textContent.trim() !== t) return; // rendered as translation
             el.classList.add('stv-learn-phrase');
@@ -352,8 +354,7 @@
         const tip = ensureTooltip();
         const py = getPinyin(phrase);
         const hv = (el.getAttribute('h') || info.hv || '').trim();
-        const meaningRaw = (el.getAttribute('v') || info.meaning || '').trim();
-        const meanings = [...new Set(meaningRaw.split('/').filter(Boolean))].slice(0, 3).join(' · ');
+        // Meaning is filled asynchronously from CC-CEDICT (see fillMeaning).
         const statusLabel = info.status === 'known' ? 'Đã thuộc' : 'Đang học';
         const suggest = info.status === 'learning' && info.exposures >= PROMOTE_SUGGEST_AT;
 
@@ -362,7 +363,7 @@
             <div class="stv-tip-phrase">${phrase}</div>
             <div class="stv-tip-pinyin">${py}</div>
             ${hv ? `<div class="stv-tip-hv">HV: ${hv}</div>` : ''}
-            ${meanings ? `<div class="stv-tip-meaning">${meanings}</div>` : ''}
+            <div class="stv-tip-meaning" id="stv-tip-meaning"></div>
             <div class="stv-tip-meta">${statusLabel} · gặp ${info.exposures} lần${info.lapses ? ` · quên ${info.lapses}` : ''}</div>
             ${suggest ? '<div class="stv-tip-suggest">Gặp nhiều rồi — đã thuộc chưa?</div>' : ''}
             <div class="stv-tip-actions">
@@ -388,6 +389,37 @@
                 window.scrollX + document.documentElement.clientWidth - tip.offsetWidth - 8
             )) + 'px';
             tip.style.top = (window.scrollY + rect.bottom + 6) + 'px';
+        }
+
+        fillMeaning(phrase);
+    }
+
+    /**
+     * Asynchronously fill the tooltip's meaning line from CC-CEDICT.
+     * Guards against the user having moved to another phrase meanwhile.
+     */
+    async function fillMeaning(phrase) {
+        const slot = () => tooltipEl && tooltipEl.querySelector('#stv-tip-meaning');
+        let el = slot();
+        if (!el) return;
+
+        if (!(await isDictReady())) {
+            if (tooltipPhrase === phrase && slot()) {
+                slot().innerHTML = '<span class="stv-tip-nodict">Tải từ điển trong bảng Học để xem nghĩa</span>';
+            }
+            return;
+        }
+
+        const m = await lookupMeaning(phrase);
+        if (tooltipPhrase !== phrase) return; // moved on
+        el = slot();
+        if (!el) return;
+        if (!m) {
+            el.textContent = '—';
+            el.classList.remove('stv-perchar');
+        } else {
+            el.textContent = m.text;
+            el.classList.toggle('stv-perchar', m.perChar);
         }
     }
 
@@ -485,26 +517,172 @@
     }
 
     // =====================================================================
+    // Dictionary (CC-CEDICT) — reliable, community-maintained meanings.
+    //
+    // Downloaded once (~25 MB) from the krmanik/cedict-json mirror (CORS-
+    // enabled GitHub raw), stored per-entry in IndexedDB keyed by simplified
+    // string, so lookups are local + offline afterwards. The site's own v
+    // "meaning" (vietphrase MT) is NOT trusted and not used.
+    // =====================================================================
+
+    const DICT_URL = 'https://raw.githubusercontent.com/krmanik/cedict-json/master/all_cedict.json';
+    const DICT_DB = 'STV_DICT_DB';
+    const DICT_STORE = 'cedict';
+    let dictDbPromise = null;
+    let dictReadyCache = null; // null = unknown, true/false once checked
+    const meaningCache = new Map();
+
+    function openDictDb() {
+        if (dictDbPromise) return dictDbPromise;
+        dictDbPromise = new Promise((resolve, reject) => {
+            const req = indexedDB.open(DICT_DB, 1);
+            req.onupgradeneeded = () => {
+                const idb = req.result;
+                if (!idb.objectStoreNames.contains(DICT_STORE)) {
+                    idb.createObjectStore(DICT_STORE); // key = simplified (external)
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+        return dictDbPromise;
+    }
+
+    function dictGet(key) {
+        return openDictDb().then(idb => new Promise((resolve, reject) => {
+            const tx = idb.transaction(DICT_STORE, 'readonly');
+            const req = tx.objectStore(DICT_STORE).get(key);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error);
+        }));
+    }
+
+    function dictCount() {
+        return openDictDb().then(idb => new Promise((resolve, reject) => {
+            const tx = idb.transaction(DICT_STORE, 'readonly');
+            const req = tx.objectStore(DICT_STORE).count();
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        }));
+    }
+
+    async function isDictReady() {
+        if (dictReadyCache !== null) return dictReadyCache;
+        try {
+            dictReadyCache = (await dictCount()) > 0;
+        } catch (e) {
+            dictReadyCache = false;
+        }
+        return dictReadyCache;
+    }
+
+    // Flatten a CC-CEDICT entry's definitions object into one gloss string.
+    function flattenDefs(entry) {
+        if (!entry || !entry.definitions) return '';
+        return Object.values(entry.definitions)
+            .join(' ')
+            .replace(/\s*;\s*$/, '')
+            .trim();
+    }
+
+    async function downloadDict() {
+        showNotification('Đang tải từ điển CC-CEDICT (~25MB)…', 'info');
+        let json;
+        try {
+            const res = await fetch(DICT_URL);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            json = await res.json();
+        } catch (e) {
+            console.error('STV-Dict: download failed', e);
+            showNotification('Tải từ điển thất bại — kiểm tra mạng rồi thử lại', 'error');
+            return false;
+        }
+
+        const idb = await openDictDb();
+        const keys = Object.keys(json);
+        const CHUNK = 5000;
+        for (let i = 0; i < keys.length; i += CHUNK) {
+            await new Promise((resolve, reject) => {
+                const tx = idb.transaction(DICT_STORE, 'readwrite');
+                const store = tx.objectStore(DICT_STORE);
+                for (let j = i; j < Math.min(i + CHUNK, keys.length); j++) {
+                    store.put(flattenDefs(json[keys[j]]), keys[j]);
+                }
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+            });
+            if (i % 25000 === 0) {
+                showNotification(`Đang lưu từ điển… ${Math.round(i / keys.length * 100)}%`, 'info');
+            }
+        }
+        dictReadyCache = true;
+        meaningCache.clear();
+        showNotification(`Từ điển sẵn sàng: ${keys.length} mục (offline)`, 'success');
+        updateDictStatus();
+        return true;
+    }
+
+    // First gloss sense, for compact per-character display.
+    function firstSense(gloss) {
+        return (gloss || '').split(/;\s*/)[0].trim();
+    }
+
+    /**
+     * Look up a phrase's meaning from CC-CEDICT. Returns
+     * { text, perChar } or null. For phrases not in the dictionary,
+     * falls back to per-character glosses.
+     */
+    async function lookupMeaning(phrase) {
+        if (meaningCache.has(phrase)) return meaningCache.get(phrase);
+        if (!(await isDictReady())) return null;
+
+        let out = null;
+        const direct = await dictGet(phrase);
+        if (direct) {
+            out = { text: direct, perChar: false };
+        } else if ([...phrase].length > 1) {
+            const parts = [];
+            for (const ch of phrase) {
+                const g = await dictGet(ch);
+                if (g) parts.push(`${ch} ${firstSense(g)}`);
+            }
+            if (parts.length) out = { text: parts.join(' · '), perChar: true };
+        }
+        meaningCache.set(phrase, out);
+        return out;
+    }
+
+    // =====================================================================
     // Anki export
     // =====================================================================
 
     /**
      * Copy the whole DB as TSV, ready for Anki import (tab-separated):
-     * phrase, pinyin, hán việt, meaning, status, exposures, added
+     * phrase, pinyin, hán việt, meaning (CC-CEDICT), status, exposures, added
      */
     async function exportAnkiTSV() {
         const db = loadDB();
-        const rows = Object.entries(db.phrases).map(([phrase, info]) => {
-            const py = getPinyin(phrase).replace(/\t/g, ' ');
-            const meaning = (info.meaning || '').replace(/\t/g, ' ');
-            return [phrase, py, info.hv || '', meaning, info.status, info.exposures, info.added].join('\t');
-        });
-        if (!rows.length) {
+        const phrases = Object.keys(db.phrases);
+        if (!phrases.length) {
             showNotification('No phrases in learning DB yet', 'error');
             return;
         }
+        const dictOn = await isDictReady();
+        const rows = [];
+        for (const phrase of phrases) {
+            const info = db.phrases[phrase];
+            const py = getPinyin(phrase).replace(/\t/g, ' ');
+            let meaning = '';
+            if (dictOn) {
+                const m = await lookupMeaning(phrase);
+                if (m) meaning = m.text.replace(/\t/g, ' ');
+            }
+            rows.push([phrase, py, info.hv || '', meaning, info.status, info.exposures, info.added].join('\t'));
+        }
         const ok = await copyToClipboard(rows.join('\n'));
-        showNotification(ok ? `Copied ${rows.length} phrases as TSV` : 'Failed to copy', ok ? 'success' : 'error');
+        showNotification(ok
+            ? `Copied ${rows.length} phrases as TSV${dictOn ? ' (with CC-CEDICT)' : ' (no dict — load it for meanings)'}`
+            : 'Failed to copy', ok ? 'success' : 'error');
     }
 
     // =====================================================================
@@ -545,6 +723,10 @@
             <div class="stv-panel-row stv-panel-buttons">
                 <button id="stv-import-btn" title="Nhập mọi $X=X từ kho cũ vào DB học">Nhập từ kho cũ</button>
                 <button id="stv-export-btn" title="Copy TSV (chữ, pinyin, Hán Việt, nghĩa) để import vào Anki">Xuất Anki</button>
+            </div>
+            <div class="stv-panel-row" id="stv-dict-row">
+                <span id="stv-dict-status">Từ điển: …</span>
+                <button id="stv-dict-btn" style="display:none;">Tải từ điển (~25MB)</button>
             </div>
             <div class="stv-panel-row" id="stv-chapter-overview"></div>
             <div class="stv-panel-hint">Thay đổi có hiệu lực từ chương kế (như cơ chế name của site). Mệt thì kéo slider xuống.</div>
@@ -625,6 +807,15 @@
         });
         panelEl.querySelector('#stv-export-btn').addEventListener('click', exportAnkiTSV);
 
+        panelEl.querySelector('#stv-dict-btn').addEventListener('click', async () => {
+            const btn = panelEl.querySelector('#stv-dict-btn');
+            btn.disabled = true;
+            btn.textContent = 'Đang tải…';
+            await downloadDict();
+            updateDictStatus();
+        });
+        updateDictStatus();
+
         // Chapter overview: tap a phrase chip to scroll to its first
         // occurrence and flash it.
         panelEl.querySelector('#stv-chapter-overview').addEventListener('click', e => {
@@ -647,6 +838,27 @@
     }
 
     /**
+     * Update the dictionary status line + load button in the panel.
+     */
+    async function updateDictStatus() {
+        if (!panelEl) return;
+        const statusEl = panelEl.querySelector('#stv-dict-status');
+        const btn = panelEl.querySelector('#stv-dict-btn');
+        if (!statusEl || !btn) return;
+        const ready = await isDictReady();
+        if (ready) {
+            const n = await dictCount();
+            statusEl.textContent = `Từ điển CC-CEDICT: ${n} mục ✓`;
+            btn.style.display = 'none';
+        } else {
+            statusEl.textContent = 'Từ điển CC-CEDICT: chưa tải';
+            btn.style.display = '';
+            btn.disabled = false;
+            btn.textContent = 'Tải từ điển (~25MB)';
+        }
+    }
+
+    /**
      * Render the per-chapter overview: how many phrases the budget applied
      * to this chapter, occurrence totals, and a chip per distinct phrase
      * (purple border = learning, teal = known; tap to jump to it).
@@ -664,22 +876,24 @@
 
         const db = loadDB();
         const totalOccurrences = Object.values(lastChapterCounts).reduce((a, b) => a + b, 0);
-        let learningCount = 0;
-        let knownCount = 0;
 
-        // Most frequent first; learning before known within equal counts.
-        phrases.sort((a, b) => lastChapterCounts[b] - lastChapterCounts[a]);
-
-        const chips = phrases.map(p => {
+        const learningPhrases = phrases.filter(p => {
             const info = db.phrases[p];
-            const isKnown = info && info.status === 'known';
-            if (isKnown) knownCount++; else learningCount++;
-            return `<span class="stv-chip ${isKnown ? 'stv-chip-known' : 'stv-chip-learning'}" data-phrase="${p}" title="Bấm để nhảy tới">${p} <small>×${lastChapterCounts[p]}</small></span>`;
-        }).join('');
+            return !info || info.status !== 'known';
+        });
+        const knownCount = phrases.length - learningPhrases.length;
+
+        // Only learning phrases get chips (known ones need no review action);
+        // most frequent first.
+        learningPhrases.sort((a, b) => lastChapterCounts[b] - lastChapterCounts[a]);
+
+        const chips = learningPhrases.map(p =>
+            `<span class="stv-chip stv-chip-learning" data-phrase="${p}" title="Bấm để nhảy tới">${p} <small>×${lastChapterCounts[p]}</small></span>`
+        ).join('');
 
         container.innerHTML = `
-            <div class="stv-overview-title">Chương này: <b>${phrases.length}</b> cụm (${learningCount} đang học, ${knownCount} đã thuộc) · <b>${totalOccurrences}</b> lần xuất hiện</div>
-            <div class="stv-overview-chips">${chips}</div>
+            <div class="stv-overview-title">Chương này: <b>${phrases.length}</b> cụm (${learningPhrases.length} đang học, ${knownCount} đã thuộc) · <b>${totalOccurrences}</b> lần xuất hiện</div>
+            ${chips ? `<div class="stv-overview-chips">${chips}</div>` : ''}
         `;
     }
 
@@ -743,6 +957,8 @@
             #stv-learn-tooltip .stv-tip-pinyin { color: #80CBC4; font-size: 15px; }
             #stv-learn-tooltip .stv-tip-hv { color: #FFCC80; font-size: 13px; }
             #stv-learn-tooltip .stv-tip-meaning { color: #ECEFF1; font-size: 13px; }
+            #stv-learn-tooltip .stv-tip-meaning.stv-perchar { color: #B0BEC5; font-style: italic; }
+            #stv-learn-tooltip .stv-tip-nodict { color: #90A4AE; font-size: 12px; }
             #stv-learn-tooltip .stv-tip-meta { color: #B0BEC5; font-size: 12px; }
             #stv-learn-tooltip .stv-tip-suggest { color: #FFD54F; font-size: 12px; margin-top: 2px; }
             #stv-learn-tooltip .stv-tip-actions { margin-top: 6px; display: flex; gap: 6px; }
@@ -828,6 +1044,13 @@
                 border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 12px;
             }
             #stv-learn-panel #stv-manual-btn:hover { background: #00695C; }
+            #stv-learn-panel #stv-dict-row { font-size: 12px; color: #555; }
+            #stv-learn-panel #stv-dict-btn {
+                margin-left: 8px; background: #5C6BC0; color: #fff; border: none;
+                border-radius: 4px; padding: 5px 10px; cursor: pointer; font-size: 12px;
+            }
+            #stv-learn-panel #stv-dict-btn:hover { background: #3F51B5; }
+            #stv-learn-panel #stv-dict-btn:disabled { background: #9FA8DA; cursor: default; }
             #stv-learn-panel .stv-panel-buttons { display: flex; gap: 6px; }
             #stv-learn-panel .stv-panel-buttons button {
                 flex: 1; background: #00897B; color: #fff; border: none;
@@ -1079,24 +1302,21 @@
 
     /**
      * Add a phrase/character to the learning DB. Returns true if newly
-     * added. Harvests Hán-Việt + meaning from any matching rendered
-     * segment so manual adds get enriched immediately.
+     * added. Harvests the Hán-Việt reading from a matching rendered segment
+     * if present (meanings come from CC-CEDICT, not the page).
      */
     function learnAddPhrase(phrase) {
         phrase = (phrase || '').trim();
         if (!phrase) return false;
         const db = loadDB();
         const added = dbAddPhrase(db, phrase);
-        // Enrich from a rendered segment if present.
         const seg = [...document.querySelectorAll('i[t]')].find(el =>
             (el.getAttribute('t') || '').trim() === phrase
         );
         if (seg) {
             const info = db.phrases[phrase];
             const h = (seg.getAttribute('h') || '').trim();
-            const v = (seg.getAttribute('v') || '').trim();
             if (h && !info.hv) info.hv = h;
-            if (v && !info.meaning) info.meaning = v;
         }
         saveDB(db);
         return added;
