@@ -238,10 +238,30 @@
         };
     }
 
-    // ---- Per-chapter active-set cache -------------------------------------
-    // The site only tokenizes new keeps on a fresh chapter load, so the
-    // presence-optimized set (computed after render) is cached per chapter
-    // (keyed by URL path) and applied at the next document-start load.
+    // =====================================================================
+    // Auto-apply via the site's own name mechanism (localStorage).
+    //
+    // We write the chapter's active $X=X set to story storage; the SITE
+    // renders the keeps when it reads storage on load. We never rewrite the
+    // chapter text ourselves — we only READ the DOM afterwards to report
+    // how many keeps actually applied.
+    //
+    // Timing: on desktop our document-start write wins the race → same-load.
+    // On iOS Safari + a userscript manager (Stay) the script may run after
+    // the page's storage read, so the write applies on the NEXT load (a
+    // reload) — the same as the site's native "names apply next chapter"
+    // behavior. The panel's "đang hiện" count makes this visible: if it
+    // stays 0 even after a reload, the site isn't reading our storage on
+    // that device and DOM rendering would be the only fallback.
+    // =====================================================================
+
+    // Panel diagnostics for the current chapter.
+    let chapterLearningActive = null;   // learning phrases that fit the budget
+    let chapterLearningPresent = null;  // learning phrases present in the text
+    let chapterRenderedLearning = null; // learning phrases actually shown (DOM)
+
+    // Per-chapter cache of the presence-optimized active set, so the next
+    // document-start can write it before the site reads (same-load on desktop).
     const ACTIVE_CACHE_KEY = 'STV_ACTIVE_CACHE';
     const ACTIVE_CACHE_MAX = 50;
 
@@ -253,23 +273,13 @@
     function saveActiveCache(cache) {
         const keys = Object.keys(cache);
         if (keys.length > ACTIVE_CACHE_MAX) {
-            // FIFO eviction of oldest entries.
             keys.slice(0, keys.length - ACTIVE_CACHE_MAX).forEach(k => delete cache[k]);
         }
         localStorage.setItem(ACTIVE_CACHE_KEY, JSON.stringify(cache));
     }
 
-    // =====================================================================
-    // Auto-apply: materialize the active subset into the story storage.
-    // Runs at document-start so the site's name loader sees the subset.
-    // =====================================================================
-
-    // The active set this load actually wrote to storage (what the site
-    // rendered) — compared after render to decide if a reload would help.
-    let renderedActiveSet = new Set();
-
     /**
-     * Materialize a list of active phrases into the story's storage:
+     * Materialize an active phrase list into the story's storage:
      *  - real translation names ($X=Y, X≠Y) are kept untouched
      *  - single-char $X=X the user added to THIS story stay (story-local)
      *  - $X=X entries are written for the active set (unless an explicit
@@ -282,79 +292,55 @@
             !e.isSelf || (e.left && !isMaterializable(e.left))
         );
         const explicitLefts = new Set(keep.map(e => e.left).filter(Boolean));
-
         const selfEntries = [...active]
             .filter(p => !explicitLefts.has(p))
             .map(p => ({ raw: `$${p}=${p}`, left: p }));
-
         const all = [...keep, ...selfEntries];
         all.sort((a, b) => {
             const la = a.left ? a.left.length : a.raw.length;
             const lb = b.left ? b.left.length : b.raw.length;
             return la - lb;
         });
-
-        const newValue = all.length ? all.map(e => e.raw).join('~//~') + '~//~' : '';
-        localStorage.setItem(storyKey, newValue);
-        return active;
+        localStorage.setItem(storyKey, all.length ? all.map(e => e.raw).join('~//~') + '~//~' : '');
     }
 
     /**
-     * At document-start, write the active set for this chapter. Prefer the
-     * presence-optimized set cached from a previous render of this exact
-     * chapter (so a reload shows phrases that are actually in the text);
-     * fall back to the global SRS pick on first-ever visit. Returns stats.
+     * document-start: write the active set so the site applies it on read.
+     * Uses the presence-optimized set cached from a previous render of this
+     * exact chapter (so revisits are same-load); falls back to the global
+     * SRS pick on first-ever visit.
      */
     function applyBudgetToStoryStorage() {
         const storyKey = getLocalStorageKeyFromURL();
-        if (!storyKey) return null;
-
+        if (!storyKey) return;
         const db = loadDB();
-        if (!db.settings.autoApply) return null;
-        if (db.settings.disabledStories.includes(storyKey)) return null;
-
-        // Pick up phrases added through the site dialog last chapter.
-        const imported = importFromNameStorages(db);
-        saveDB(db);
+        if (!db.settings.autoApply || db.settings.disabledStories.includes(storyKey)) return;
+        if (importFromNameStorages(db)) saveDB(db);
 
         const cache = loadActiveCache();
         const cached = cache[window.location.pathname];
         let activeList;
-        let fromCache = false;
         if (cached &&
             cached.budget === db.settings.budget &&
             cached.showKnown === db.settings.showKnown) {
             activeList = cached.active;
-            fromCache = true;
         } else {
-            // First visit (no presence info yet) — global SRS pick.
             const { known, learningActive } = selectActivePhrases(db);
-            activeList = [
-                ...(db.settings.showKnown ? known : []),
-                ...learningActive
-            ];
+            activeList = [...(db.settings.showKnown ? known : []), ...learningActive];
         }
-
-        renderedActiveSet = writeActiveToStorage(storyKey, activeList);
-
-        return {
-            active: activeList.length,
-            fromCache,
-            imported
-        };
+        writeActiveToStorage(storyKey, activeList);
     }
 
-    // Notify-to-reload at most once per page load.
-    let reloadSuggested = false;
+    let reloadHintShown = false;
 
     /**
-     * After the chapter renders, compute the presence-optimized active set
-     * (phrases that actually occur in this chapter), cache it for the next
-     * load, and — if a reload would surface more learning phrases than are
-     * currently shown — suggest reloading. This is the "pick the phrases we
-     * have, to the max, from this chapter" step.
+     * After render: optimize the active set for phrases actually present in
+     * this chapter, persist it to storage + cache (for this and next load),
+     * then READ the DOM to count how many learning phrases actually rendered
+     * as Chinese. If fewer rendered than were saved, show a one-time reload
+     * hint (the site applies on the next load when our write lost the race).
      */
-    function optimizeChapterActiveSet() {
+    function syncChapterKeeps() {
         const storyKey = getLocalStorageKeyFromURL();
         if (!storyKey) return;
         const db = loadDB();
@@ -364,7 +350,7 @@
         if (!text) return;
 
         const { active, learningActive, learningPresent } = selectActiveForChapter(db, text);
-
+        writeActiveToStorage(storyKey, active);
         const cache = loadActiveCache();
         cache[window.location.pathname] = {
             active,
@@ -373,29 +359,30 @@
         };
         saveActiveCache(cache);
 
-        // Would reloading add learning phrases not currently rendered?
-        const newlyShowable = active.filter(p =>
-            !renderedActiveSet.has(p) &&
-            db.phrases[p] && db.phrases[p].status !== 'known'
-        ).length;
+        // READ-ONLY: distinct active learning phrases shown as Chinese now.
+        const activeSet = new Set(active);
+        const rendered = new Set();
+        document.querySelectorAll('.contentbox i[t]').forEach(el => {
+            const t = (el.getAttribute('t') || '').trim();
+            if (activeSet.has(t) && el.textContent.trim() === t &&
+                db.phrases[t] && db.phrases[t].status !== 'known') {
+                rendered.add(t);
+            }
+        });
 
         chapterLearningActive = learningActive;
         chapterLearningPresent = learningPresent;
-        updatePanelStats(Object.keys(lastChapterCounts).length);
+        chapterRenderedLearning = rendered.size;
+        if (panelEl) updatePanelStats(Object.keys(lastChapterCounts).length);
 
-        if (newlyShowable > 0 && !reloadSuggested) {
-            reloadSuggested = true;
+        if (rendered.size < learningActive && !reloadHintShown) {
+            reloadHintShown = true;
             showNotification(
-                `Chương này có ${learningPresent} cụm đang học (hiện ${learningActive}). Tải lại trang (F5) để áp dụng.`,
+                `Đã lưu ${learningActive} cụm cho chương này (đang hiện ${rendered.size}). Tải lại trang (F5) để hiển thị.`,
                 'info'
             );
         }
     }
-
-    // Diagnostics for the panel: learning phrases present in / shown for
-    // the current chapter (set by optimizeChapterActiveSet).
-    let chapterLearningActive = null;
-    let chapterLearningPresent = null;
 
     // =====================================================================
     // Annotation: find kept-Chinese occurrences in the rendered chapter,
@@ -450,7 +437,6 @@
         lastChapterCounts = counts;
         updatePanelStats(Object.keys(counts).length);
         updateChapterOverview();
-        optimizeChapterActiveSet();
     }
 
     /**
@@ -460,7 +446,10 @@
         let timer = null;
         const schedule = () => {
             clearTimeout(timer);
-            timer = setTimeout(annotateRenderedPhrases, 1500);
+            timer = setTimeout(() => {
+                annotateRenderedPhrases();
+                syncChapterKeeps();
+            }, 1500);
         };
         const observer = new MutationObserver(mutations => {
             for (const mutation of mutations) {
@@ -1075,8 +1064,12 @@
         if (statsEl) {
             // "Chương này": learning phrases present in this chapter and how
             // many fit the budget (more honest than the global budget count).
+            // "X/Y đang học có mặt (đang hiện Z)": X fit the budget, Y are
+            // present in the chapter, Z are actually rendered as Chinese now.
+            // Z < X means the site hasn't applied our storage yet → reload.
             const chapterInfo = (chapterLearningPresent !== null)
-                ? ` · Chương này: <b>${chapterLearningActive}</b>/${chapterLearningPresent} đang học có mặt`
+                ? ` · Chương này: <b>${chapterLearningActive}</b>/${chapterLearningPresent} đang học có mặt` +
+                  (chapterRenderedLearning !== null ? ` (đang hiện ${chapterRenderedLearning})` : '')
                 : '';
             statsEl.innerHTML =
                 `Đang học: <b>${learningTotal}</b>` +
@@ -1968,12 +1961,10 @@
      * Initialize the script
      */
     function init() {
-        // FIRST, before the site reads its name list: materialize the
-        // budgeted learning subset into this story's storage. Pure
-        // localStorage work — safe at document-start.
-        let applyStats = null;
+        // At document-start (before the site reads its name list, on desktop):
+        // write this chapter's active $X=X set so the site applies the keeps.
         try {
-            applyStats = applyBudgetToStoryStorage();
+            applyBudgetToStoryStorage();
         } catch (e) {
             console.error('STV-Learn: auto-apply failed', e);
         }
@@ -1987,18 +1978,9 @@
             addKeyboardShortcut();
             setupTooltipDelegation();
             monitorForNsbox();
-            watchForChapterContent();
+            watchForChapterContent(); // renders keeps directly into the DOM
 
             loadPinyinLibrary().catch(err => console.error('Could not load pinyin library:', err));
-
-            if (applyStats) {
-                showNotification(
-                    `Học: áp dụng ${applyStats.active} cụm` +
-                    (applyStats.fromCache ? ' (đã tối ưu cho chương này)' : ' (lần đầu — đọc xong sẽ gợi ý tải lại)') +
-                    (applyStats.imported ? ` · nhập ${applyStats.imported} mới` : ''),
-                    'info'
-                );
-            }
         };
 
         if (document.readyState === 'loading') {
