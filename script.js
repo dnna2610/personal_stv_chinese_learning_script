@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.2
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -26,7 +26,7 @@
     //      we arrived this load, i.e. what the SITE preserved from our last
     //      write. If our last-write count > this, the site clobbered us.
     // =====================================================================
-    const DBG = { persistPrev: null, persistOK: null, storyKeyAtStart: null, selfCountAtStart: null, selfCountAfterWrite: null, lastWriteCount: null };
+    const DBG = { persistPrev: null, persistOK: null, storyKeyAtStart: null, selfCountAtStart: null, selfCountAfterWrite: null, lastWriteCount: null, syncSkipped: null, errors: [] };
     try {
         const raw = localStorage.getItem('STV_PERSIST_PROBE');
         DBG.persistPrev = raw === null ? null : parseInt(raw, 10);
@@ -35,20 +35,37 @@
         localStorage.setItem('STV_PERSIST_PROBE', String(next));
     } catch (e) { /* storage unavailable */ }
 
+    /**
+     * Surface a caught failure to the user. There is no console on iOS, so
+     * every error goes to a toast AND the panel's debug row — a silent
+     * failure here looks like "the button does nothing".
+     */
+    function reportError(context, e) {
+        const detail = e && e.name ? `${e.name}: ${e.message || ''}` : String(e);
+        const msg = `${context} — ${detail}`;
+        DBG.errors.push(msg);
+        if (DBG.errors.length > 5) DBG.errors.shift();
+        console.error('STV-Learn:', context, e);
+        try { showNotification(msg, 'error'); } catch (e2) { /* no DOM yet */ }
+        try { if (panelEl) updateDebugRow(); } catch (e2) { /* panel not built */ }
+    }
+
     // =====================================================================
     // Learning DB
     //
     // Master vocabulary store, independent of the site's per-story name
-    // storages. The story storage is treated as a render target: at every
-    // page load (document-start, before the site reads its name list) a
-    // budgeted subset of phrases is materialized into it as $X=X entries.
-    // The site then renders the chapter with exactly that subset — names
-    // take effect on chapter load, which is the site's native behavior.
+    // storages. The story storage is treated as a render target: when the
+    // user presses "Áp dụng", a budgeted subset of phrases (present in the
+    // current chapter) is materialized into it as $X=X entries. The site
+    // then renders that subset on the next page load — names take effect
+    // on chapter load, which is the site's native behavior. Writes are
+    // user-triggered only; automatic writes raced the site's late content
+    // load on mobile.
     //
     // Shape:
     // {
     //   version: 1,
-    //   settings: { budget: 15, autoApply: true, disabledStories: [] },
+    //   settings: { budget: 15, disabledStories: [] },
     //   phrases: {
     //     "修炼": { added: "2026-06-11", status: "learning"|"known",
     //               exposures: 0, lapses: 0, lastSeen: "2026-06-11"|null,
@@ -82,7 +99,6 @@
                 if (db && db.phrases) {
                     db.settings = db.settings || {};
                     if (typeof db.settings.budget !== 'number') db.settings.budget = DEFAULT_BUDGET;
-                    if (typeof db.settings.autoApply !== 'boolean') db.settings.autoApply = true;
                     if (typeof db.settings.showKnown !== 'boolean') db.settings.showKnown = true;
                     if (!Array.isArray(db.settings.disabledStories)) db.settings.disabledStories = [];
                     return db;
@@ -93,13 +109,23 @@
         }
         return {
             version: 1,
-            settings: { budget: DEFAULT_BUDGET, autoApply: true, showKnown: true, disabledStories: [] },
+            settings: { budget: DEFAULT_BUDGET, showKnown: true, disabledStories: [] },
             phrases: {}
         };
     }
 
+    /**
+     * Persist the learning DB. Returns false (after telling the user) when
+     * the write fails — typically QuotaExceededError on iOS.
+     */
     function saveDB(db) {
-        localStorage.setItem(DB_KEY, JSON.stringify(db));
+        try {
+            localStorage.setItem(DB_KEY, JSON.stringify(db));
+            return true;
+        } catch (e) {
+            reportError('LƯU DB THẤT BẠI (thay đổi sẽ mất khi tải lại)', e);
+            return false;
+        }
     }
 
     function dbAddPhrase(db, phrase) {
@@ -135,24 +161,6 @@
     }
 
     /**
-     * Import every $X=X entry from the global store and the current story's
-     * store into the learning DB (as "learning"). Returns count added.
-     */
-    function importFromNameStorages(db) {
-        let added = 0;
-        const sources = [localStorage.getItem(GLOBAL_KEY)];
-        const storyKey = getLocalStorageKeyFromURL();
-        if (storyKey) sources.push(localStorage.getItem(storyKey));
-
-        sources.forEach(value => {
-            parseStorageEntries(value).forEach(entry => {
-                if (entry.isSelf && dbAddPhrase(db, entry.left)) added++;
-            });
-        });
-        return added;
-    }
-
-    /**
      * Single-character names break the machine translation badly (是, 了
      * etc. are everywhere and wreck whole sentences), so they are never
      * materialized into story storage. They stay in the DB for Anki export
@@ -179,7 +187,13 @@
             const seenA = ia.lastSeen || '';
             const seenB = ib.lastSeen || '';
             if (seenA !== seenB) return seenA < seenB ? -1 : 1; // '' (never) first
-            return ia.exposures - ib.exposures;
+            if (ia.exposures !== ib.exposures) return ia.exposures - ib.exposures;
+            // Among equally-unseen phrases, most recently ADDED first — a
+            // phrase added today (manual/scan) should surface now, not queue
+            // behind thousands of never-seen backlog imports.
+            const addA = ia.added || '', addB = ib.added || '';
+            if (addA !== addB) return addA > addB ? -1 : 1;
+            return 0;
         };
     }
 
@@ -254,48 +268,27 @@
             active,
             knownPresent: known.length,
             learningActive: learningActive.length,
-            learningPresent: learning.length
+            learningPresent: learning.length,
+            knownList: known,
+            learningList: learning // SRS-ordered, present in this chapter
         };
     }
 
     // =====================================================================
-    // Auto-apply via the site's own name mechanism (localStorage).
+    // MANUAL apply via the site's own name mechanism (localStorage).
     //
-    // We write the chapter's active $X=X set to story storage; the SITE
-    // renders the keeps when it reads storage on load. We never rewrite the
-    // chapter text ourselves — we only READ the DOM afterwards to report how
-    // many keeps actually applied ("đang hiện" in the panel).
+    // The user presses "Áp dụng" in the panel: we pick this chapter's
+    // active $X=X set (budgeted SRS, presence-filtered) and write it to
+    // story storage; the SITE renders the keeps when it reads storage on
+    // the next load. Nothing writes story storage automatically anymore —
+    // on mobile the chapter content loads late and an automatic write
+    // raced the site's read, clobbering manual additions.
     // =====================================================================
 
     // Panel diagnostics for the current chapter.
-    let chapterLearningActive = null;   // learning phrases that fit the budget
+    let chapterLearningActive = null;   // learning phrases saved in storage + present
     let chapterLearningPresent = null;  // learning phrases present in the text
     let chapterRenderedLearning = null; // learning phrases actually shown (DOM read)
-
-    // Per-chapter cache of the presence-optimized active set, so the next
-    // document-start can write it before the site reads (same-load on desktop).
-    const ACTIVE_CACHE_KEY = 'STV_ACTIVE_CACHE';
-    const ACTIVE_CACHE_MAX = 50;
-
-    function loadActiveCache() {
-        try { return JSON.parse(localStorage.getItem(ACTIVE_CACHE_KEY)) || {}; }
-        catch (e) { return {}; }
-    }
-
-    function saveActiveCache(cache) {
-        const keys = Object.keys(cache);
-        if (keys.length > ACTIVE_CACHE_MAX) {
-            keys.slice(0, keys.length - ACTIVE_CACHE_MAX).forEach(k => delete cache[k]);
-        }
-        localStorage.setItem(ACTIVE_CACHE_KEY, JSON.stringify(cache));
-    }
-
-    // Drop all cached chapter sets so they recompute — call after anything
-    // that changes which phrases should be active (e.g. promoting a phrase
-    // to "thuộc" frees a budget slot for a new learning phrase).
-    function invalidateActiveCache() {
-        localStorage.removeItem(ACTIVE_CACHE_KEY);
-    }
 
     /**
      * Materialize an active phrase list into the story's storage:
@@ -320,123 +313,130 @@
             const lb = b.left ? b.left.length : b.raw.length;
             return la - lb;
         });
-        localStorage.setItem(storyKey, all.length ? all.map(e => e.raw).join('~//~') + '~//~' : '');
+        try {
+            localStorage.setItem(storyKey, all.length ? all.map(e => e.raw).join('~//~') + '~//~' : '');
+        } catch (e) {
+            reportError('Ghi kho truyện thất bại', e);
+        }
     }
 
     /**
-     * document-start: write the active set so the site applies it on read.
-     * Uses the presence-optimized set cached from a previous render of this
-     * exact chapter (so revisits are same-load); falls back to the global
-     * SRS pick on first-ever visit.
+     * Append one $X=X entry to story storage right away (explicit user
+     * add — allowed to exceed the budget). The phrase shows after the
+     * next reload without needing an "Áp dụng" pass.
      */
-    function applyBudgetToStoryStorage() {
+    function appendSelfEntryToStory(phrase) {
         const storyKey = getLocalStorageKeyFromURL();
         if (!storyKey) return;
+        try {
+            const entries = parseStorageEntries(localStorage.getItem(storyKey));
+            if (entries.some(en => en.left === phrase)) return;
+            entries.push({ raw: `$${phrase}=${phrase}`, left: phrase });
+            entries.sort((a, b) => {
+                const la = a.left ? a.left.length : a.raw.length;
+                const lb = b.left ? b.left.length : b.raw.length;
+                return la - lb;
+            });
+            localStorage.setItem(storyKey, entries.map(en => en.raw).join('~//~') + '~//~');
+        } catch (e) {
+            reportError('Ghi kho truyện thất bại', e);
+        }
+    }
 
-        // CLOBBER PROBE: how many $X=X did the story key hold when we arrived,
-        // i.e. what the site preserved from our previous write?
+    /**
+     * document-start: record what the story key held when we arrived
+     * (debug only — no writes happen automatically anymore).
+     */
+    function recordStorageProbe() {
+        const storyKey = getLocalStorageKeyFromURL();
+        if (!storyKey) return;
         DBG.storyKeyAtStart = storyKey;
         DBG.selfCountAtStart = parseStorageEntries(localStorage.getItem(storyKey))
             .filter(e => e.isSelf).length;
-
-        const db = loadDB();
-        if (!db.settings.autoApply || db.settings.disabledStories.includes(storyKey)) return;
-        if (importFromNameStorages(db)) saveDB(db);
-
-        const cache = loadActiveCache();
-        const cached = cache[window.location.pathname];
-        let activeList;
-        if (cached &&
-            cached.budget === db.settings.budget &&
-            cached.showKnown === db.settings.showKnown) {
-            activeList = cached.active;
-        } else {
-            const { known, learningActive } = selectActivePhrases(db);
-            activeList = [...(db.settings.showKnown ? known : []), ...learningActive];
-        }
-        writeActiveToStorage(storyKey, activeList);
-        DBG.lastWriteCount = activeList.length;
-
-        // Read straight back: did our write even land in this storage?
-        DBG.selfCountAfterWrite = parseStorageEntries(localStorage.getItem(storyKey))
-            .filter(e => e.isSelf).length;
     }
 
-    let reloadHintShown = false;
+    /**
+     * "Áp dụng" button: pick this chapter's active set — all "known"
+     * phrases (if shown) plus up to `budget` learning phrases via SRS,
+     * restricted to phrases actually present in the chapter text — and
+     * write it to story storage. The site renders it on the next load,
+     * so the user reloads when ready. Entirely user-triggered: no race
+     * with the site's late content load on mobile.
+     */
+    function applyBudgetNow() {
+        try {
+            const storyKey = getLocalStorageKeyFromURL();
+            if (!storyKey) {
+                showNotification('Không xác định được key truyện từ URL', 'error');
+                return;
+            }
+            const db = loadDB();
+            if (db.settings.disabledStories.includes(storyKey)) {
+                showNotification('Truyện này đang tắt học — bật lại trong bảng Học rồi thử lại', 'error');
+                return;
+            }
+            const text = reconstructChapterText();
+            if (!text) {
+                showNotification('Chưa thấy nội dung chương — đợi trang tải xong rồi bấm lại', 'error');
+                return;
+            }
+
+            const sel = selectActiveForChapter(db, text);
+            writeActiveToStorage(storyKey, sel.active);
+            DBG.lastWriteCount = sel.active.length;
+            // Read straight back: did the write land?
+            DBG.selfCountAfterWrite = parseStorageEntries(localStorage.getItem(storyKey))
+                .filter(e => e.isSelf).length;
+
+            updateChapterDiagnostics();
+            updatePanelStats();
+
+            const knownNote = (db.settings.showKnown && sel.knownPresent)
+                ? ` + ${sel.knownPresent} đã thuộc` : '';
+            showNotification(
+                `Đã áp dụng ${sel.learningActive}/${sel.learningPresent} cụm đang học${knownNote} cho chương này — tải lại trang (F5) để hiển thị`,
+                'success'
+            );
+        } catch (e) {
+            reportError('Áp dụng thất bại', e);
+        }
+    }
 
     /**
-     * After render: optimize the active set for phrases actually present in
-     * this chapter, persist it to storage + cache (for this and next load),
-     * then READ the DOM to count how many learning phrases actually rendered
-     * as Chinese. If fewer rendered than were saved, show a one-time reload
-     * hint (the site applies on the next load when our write lost the race).
+     * After render (READ-ONLY): report this chapter's state in the panel —
+     * how many learning phrases are present in the text, how many of those
+     * are saved in story storage, and how many actually rendered as
+     * Chinese. Never writes story storage (that's the Áp dụng button).
      */
-    function syncChapterKeeps() {
+    function updateChapterDiagnostics() {
+        DBG.syncSkipped = null;
         const storyKey = getLocalStorageKeyFromURL();
-        if (!storyKey) return;
+        if (!storyKey) { DBG.syncSkipped = 'không có key truyện'; return; }
         const db = loadDB();
-        if (!db.settings.autoApply || db.settings.disabledStories.includes(storyKey)) return;
-
         const text = reconstructChapterText();
-        if (!text) return;
+        if (!text) { DBG.syncSkipped = 'chưa thấy nội dung chương'; return; }
 
-        // Present phrases (for the count) and a fresh SRS pick (first visit).
         const sel = selectActiveForChapter(db, text);
 
-        // STABLE per-chapter set: reuse the set chosen for this exact chapter
-        // instead of recomputing — otherwise seeing phrases demotes them in
-        // SRS and the "active" set churns every load (never matching what's
-        // rendered). Only recompute on first visit or when settings change.
-        const cache = loadActiveCache();
-        const cached = cache[window.location.pathname];
-        let active;
-        if (cached &&
-            cached.budget === db.settings.budget &&
-            cached.showKnown === db.settings.showKnown) {
-            // Keep only entries still present + still in the DB as wanted.
-            active = cached.active.filter(p =>
-                text.includes(p) && isMaterializable(p) && db.phrases[p] &&
-                (db.phrases[p].status !== 'known' || db.settings.showKnown)
-            );
-        } else {
-            active = sel.active;
-        }
-        cache[window.location.pathname] = {
-            active,
-            budget: db.settings.budget,
-            showKnown: db.settings.showKnown
-        };
-        saveActiveCache(cache);
-        writeActiveToStorage(storyKey, active);
+        const storedSelf = new Set(parseStorageEntries(localStorage.getItem(storyKey))
+            .filter(e => e.isSelf).map(e => e.left));
+        const storedLearning = [...storedSelf].filter(p =>
+            p && isMaterializable(p) && text.includes(p) &&
+            db.phrases[p] && db.phrases[p].status !== 'known');
 
-        // READ-ONLY: of the chosen set, how many learning phrases did the
-        // site render as Chinese this load?
-        const activeSet = new Set(active);
-        const learningActive = active.filter(p =>
-            db.phrases[p] && db.phrases[p].status !== 'known').length;
         const rendered = new Set();
         document.querySelectorAll('.contentbox i[t]').forEach(el => {
             const t = (el.getAttribute('t') || '').trim();
-            if (activeSet.has(t) && el.textContent.trim() === t &&
+            if (storedSelf.has(t) && el.textContent.trim() === t &&
                 db.phrases[t] && db.phrases[t].status !== 'known') {
                 rendered.add(t);
             }
         });
 
-        chapterLearningActive = learningActive;
+        chapterLearningActive = storedLearning.length;
         chapterLearningPresent = sel.learningPresent;
         chapterRenderedLearning = rendered.size;
         if (panelEl) updatePanelStats(Object.keys(lastChapterCounts).length);
-
-        // First visit to a chapter writes the stable set but the site read
-        // the previous storage value — a reload makes it read our set.
-        if (rendered.size < learningActive && !reloadHintShown) {
-            reloadHintShown = true;
-            showNotification(
-                `Đã lưu ${learningActive} cụm cho chương này (đang hiện ${rendered.size}). Tải lại trang (F5) để hiển thị.`,
-                'info'
-            );
-        }
     }
 
     // =====================================================================
@@ -502,10 +502,11 @@
         const schedule = () => {
             clearTimeout(timer);
             timer = setTimeout(() => {
-                // Render keeps (storage + DOM safety-net) first, then count /
-                // harvest the now-fully-applied chapter.
-                syncChapterKeeps();
-                annotateRenderedPhrases();
+                // READ-ONLY passes: report chapter state, then annotate /
+                // harvest the rendered keeps. Each step isolated: one
+                // failing must not silently kill the other.
+                try { updateChapterDiagnostics(); } catch (e) { reportError('Đọc trạng thái chương thất bại', e); }
+                try { annotateRenderedPhrases(); } catch (e) { reportError('Đánh dấu cụm thất bại', e); }
             }, 1500);
         };
         const observer = new MutationObserver(mutations => {
@@ -649,17 +650,14 @@
 
         if (action === 'promote') {
             info.status = 'known';
-            invalidateActiveCache(); // free the slot for a new learning phrase
-            showNotification(`"${phrase}" → đã thuộc. Slot trống cho từ mới (tải lại trang)!`, 'success');
+            showNotification(`"${phrase}" → đã thuộc. Slot trống cho từ mới — bấm Áp dụng khi muốn!`, 'success');
         } else if (action === 'demote') {
             info.status = 'learning';
-            invalidateActiveCache();
             showNotification(`"${phrase}" → học lại`, 'info');
         } else if (action === 'lapse') {
             info.lapses++;
-            info.lastSeen = null; // jump the queue at next chapter load
+            info.lastSeen = null; // jump the queue at the next Áp dụng
             if (info.status === 'known') info.status = 'learning';
-            invalidateActiveCache();
             showNotification(`"${phrase}" sẽ được ưu tiên hiện lại`, 'info');
         }
         saveDB(db);
@@ -927,7 +925,7 @@
                 Bật học cho truyện này
             </label>
             <div class="stv-panel-row stv-panel-buttons">
-                <button id="stv-import-btn" title="Nhập mọi $X=X từ kho cũ vào DB học">Nhập từ kho cũ</button>
+                <button id="stv-apply-btn" title="Chọn cụm theo budget cho chương này và lưu vào kho — tải lại trang để hiển thị">Áp dụng</button>
                 <button id="stv-export-btn" title="Copy TSV (chữ, pinyin, Hán Việt, nghĩa) để import vào Anki">Xuất Anki</button>
             </div>
             <div class="stv-panel-row" id="stv-dict-row">
@@ -936,7 +934,7 @@
             </div>
             <div class="stv-panel-row" id="stv-chapter-overview"></div>
             <div class="stv-panel-row" id="stv-debug-row"></div>
-            <div class="stv-panel-hint">Thay đổi có hiệu lực từ chương kế (như cơ chế name của site). Mệt thì kéo slider xuống.</div>
+            <div class="stv-panel-hint">Bấm <b>Áp dụng</b> để chọn cụm cho chương này, rồi tải lại trang để hiển thị. Mệt thì kéo slider xuống.</div>
         `;
         document.body.appendChild(panelEl);
 
@@ -948,7 +946,7 @@
             const db2 = loadDB();
             db2.settings.budget = parseInt(slider.value, 10);
             saveDB(db2);
-            showNotification(`Budget: ${slider.value} cụm — hiệu lực từ chương kế`, 'info');
+            showNotification(`Budget: ${slider.value} cụm — bấm Áp dụng để dùng`, 'info');
             updatePanelStats();
         });
 
@@ -956,14 +954,18 @@
         const submitManual = () => {
             const value = manualInput.value.trim();
             if (!value) return;
-            const added = learnAddPhrase(value);
+            const result = learnAddPhrase(value);
+            if (result === 'error') return; // saveDB already told the user
             manualInput.value = '';
+            // Materialize the explicit add into this story right away so
+            // it shows after a reload without an Áp dụng pass.
+            if (result === 'added' && isMaterializable(value)) appendSelfEntryToStory(value);
             updatePanelStats();
             refreshNewHighlight();
             const singleNote = !isMaterializable(value) ? ' (1 ký tự: chỉ Anki + nhận diện)' : '';
-            showNotification(added
-                ? `Đã thêm "${value}"${singleNote} — hiệu lực từ chương kế`
-                : `"${value}" đã có trong kho`, added ? 'success' : 'info');
+            showNotification(result === 'added'
+                ? `Đã thêm "${value}"${singleNote} — tải lại trang để hiện trong chương này`
+                : `"${value}" đã có trong kho`, result === 'added' ? 'success' : 'info');
         };
         panelEl.querySelector('#stv-manual-btn').addEventListener('click', submitManual);
         manualInput.addEventListener('keydown', e => {
@@ -975,8 +977,8 @@
             db2.settings.showKnown = e.target.checked;
             saveDB(db2);
             showNotification(e.target.checked
-                ? 'Cụm đã thuộc sẽ hiển thị (từ chương kế)'
-                : 'Ẩn cụm đã thuộc — slider 0 = tắt hẳn (từ chương kế)', 'info');
+                ? 'Cụm đã thuộc sẽ hiển thị (bấm Áp dụng để cập nhật)'
+                : 'Ẩn cụm đã thuộc — slider 0 = tắt hẳn (bấm Áp dụng để cập nhật)', 'info');
             updatePanelStats();
         });
 
@@ -1000,18 +1002,12 @@
             }
             saveDB(db2);
             showNotification(e.target.checked
-                ? 'Bật học cho truyện này (từ chương kế)'
-                : 'Tắt học cho truyện này — chữ Trung sẽ biến mất từ chương kế', 'info');
+                ? 'Bật học cho truyện này — bấm Áp dụng để chọn cụm'
+                : 'Tắt học cho truyện này — chữ Trung sẽ biến mất sau khi tải lại', 'info');
         });
 
         panelEl.querySelector('#stv-panel-close').addEventListener('click', togglePanel);
-        panelEl.querySelector('#stv-import-btn').addEventListener('click', () => {
-            const db2 = loadDB();
-            const n = importFromNameStorages(db2);
-            saveDB(db2);
-            showNotification(`Imported ${n} new phrase(s) into learning DB`, n ? 'success' : 'info');
-            updatePanelStats();
-        });
+        panelEl.querySelector('#stv-apply-btn').addEventListener('click', applyBudgetNow);
         panelEl.querySelector('#stv-export-btn').addEventListener('click', exportAnkiTSV);
 
         panelEl.querySelector('#stv-dict-btn').addEventListener('click', async () => {
@@ -1087,10 +1083,28 @@
                 .filter(e => e.isSelf).length;
         }
 
+        // Total localStorage usage — quota trouble (iOS ~5MB) shows up here.
+        let usage = '—';
+        try {
+            let chars = 0;
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                chars += k.length + (localStorage.getItem(k) || '').length;
+            }
+            usage = Math.round(chars * 2 / 1024) + ' KB';
+        } catch (e) { /* leave dash */ }
+
+        const fmt = v => (v === null || v === undefined) ? '—' : v;
+        const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
         el.innerHTML =
             `<b>Debug</b> · key: <code>${DBG.storyKeyAtStart || '—'}</code>` +
-            `<br>Lưu sống sót qua reload: <b>${persist}</b>` +
-            `<br>$X=X lúc vào: <b>${DBG.selfCountAtStart}</b> · sau khi ghi: <b>${DBG.selfCountAfterWrite}</b> · bây giờ: <b>${nowCount}</b> (đã ghi ${DBG.lastWriteCount})`;
+            `<br>Lưu sống sót qua reload: <b>${persist}</b> · dung lượng: <b>${usage}</b>` +
+            `<br>$X=X lúc vào: <b>${fmt(DBG.selfCountAtStart)}</b> · sau khi ghi: <b>${fmt(DBG.selfCountAfterWrite)}</b> · bây giờ: <b>${nowCount}</b> (đã ghi ${fmt(DBG.lastWriteCount)})` +
+            (DBG.syncSkipped ? `<br>Chẩn đoán chương bỏ qua: <b>${esc(DBG.syncSkipped)}</b>` : '') +
+            (DBG.errors.length
+                ? `<br><span style="color:#C62828">Lỗi gần đây:<br>${DBG.errors.slice(-3).map(esc).join('<br>')}</span>`
+                : '');
     }
 
     /**
@@ -1152,11 +1166,12 @@
 
         const statsEl = panelEl.querySelector('#stv-panel-stats');
         if (statsEl) {
-            // "X/Y đang học có mặt (đang hiện Z)": X fit the budget, Y are
-            // present in the chapter, Z are rendered as Chinese right now.
-            // Z < X on a first visit → reload to apply the stored set.
+            // "đã lưu X/Y đang học (đang hiện Z)": X are saved in story
+            // storage and present here, Y are present in the chapter, Z are
+            // rendered as Chinese right now. Z < X → reload to apply the
+            // stored set; X = 0 → press Áp dụng to pick a set.
             const chapterInfo = (chapterLearningPresent !== null)
-                ? ` · Chương này: <b>${chapterLearningActive}</b>/${chapterLearningPresent} đang học có mặt` +
+                ? ` · Chương này: đã lưu <b>${chapterLearningActive}</b>/${chapterLearningPresent} đang học` +
                   (chapterRenderedLearning !== null ? ` (đang hiện ${chapterRenderedLearning})` : '')
                 : '';
             statsEl.innerHTML =
@@ -1453,7 +1468,21 @@
     /**
      * Show a temporary notification to the user
      */
+    const pendingNotifications = [];
+    function flushPendingNotifications() {
+        while (pendingNotifications.length && document.body) {
+            const [m, t] = pendingNotifications.shift();
+            showNotification(m, t);
+        }
+    }
+
     function showNotification(message, type = 'info') {
+        // document-start: no <body> yet — queue and show after DOM is ready.
+        if (!document.body) {
+            pendingNotifications.push([message, type]);
+            document.addEventListener('DOMContentLoaded', flushPendingNotifications, { once: true });
+            return;
+        }
         const notification = document.createElement('div');
         notification.textContent = message;
         notification.style.cssText = `
@@ -1569,7 +1598,7 @@
      */
     function learnAddPhrase(phrase) {
         phrase = (phrase || '').trim();
-        if (!phrase) return false;
+        if (!phrase) return 'empty';
         const db = loadDB();
         const added = dbAddPhrase(db, phrase);
         const seg = [...document.querySelectorAll('i[t]')].find(el =>
@@ -1580,8 +1609,8 @@
             const h = (seg.getAttribute('h') || '').trim();
             if (h && !info.hv) info.hv = h;
         }
-        saveDB(db);
-        return added;
+        if (!saveDB(db)) return 'error';
+        return added ? 'added' : 'exists';
     }
 
     /**
@@ -1695,6 +1724,16 @@
      * actually render as Chinese (from the next chapter load).
      */
     function scanAndCollect() {
+        // The button must ALWAYS answer — an uncaught error here used to
+        // look like "Scan does nothing".
+        try {
+            doScanAndCollect();
+        } catch (e) {
+            reportError('Scan thất bại', e);
+        }
+    }
+
+    function doScanAndCollect() {
         const storageKey = getLocalStorageKeyFromURL();
         if (!storageKey) {
             showNotification('Could not determine localStorage key from URL', 'error');
@@ -1768,11 +1807,15 @@
         candidates.forEach(p => {
             if (dbAddPhrase(db, p)) added++;
         });
-        saveDB(db);
+        const saved = saveDB(db);
         updatePanelStats();
 
         console.log('STV-Learn: scan collected', [...candidates].join(', '));
-        showNotification(`Đã thêm ${added} cụm mới vào DB học — hiệu lực từ chương kế`, 'success');
+        if (!saved) {
+            showNotification(`Tìm thấy ${added} cụm mới nhưng LƯU THẤT BẠI — xem Debug trong bảng Học`, 'error');
+            return;
+        }
+        showNotification(`Đã thêm ${added} cụm mới vào DB học — bấm Áp dụng để hiển thị theo budget`, 'success');
 
         // Harvest hv/meaning for the new phrases from this chapter's
         // <i h= v=> attributes right away.
@@ -1865,7 +1908,7 @@
         const singleNote = !isMaterializable(chineseText)
             ? ' (1 ký tự: chỉ truyện này + Anki, không tự lan)'
             : '';
-        showNotification(`Added "${chineseText}"${isNew ? ' (+learn DB)' : ''}${singleNote} — hiệu lực từ chương kế!`, 'success');
+        showNotification(`Added "${chineseText}"${isNew ? ' (+learn DB)' : ''}${singleNote} — tải lại trang để hiển thị!`, 'success');
     }
 
     /**
@@ -1971,7 +2014,9 @@
             addButton.style.fontSize = '12px';
             addButton.innerHTML = '<i class="fas fa-plus"></i> Add';
             addButton.title = 'Add Chinese word to localStorage';
-            addButton.addEventListener('click', addChineseToLocalStorage);
+            addButton.addEventListener('click', () => {
+                try { addChineseToLocalStorage(); } catch (e) { reportError('Thêm từ thất bại', e); }
+            });
 
             const searchButton = zwRow.querySelector('button[onclick*="googlesearch"]');
             if (searchButton) {
@@ -2054,12 +2099,15 @@
      * Initialize the script
      */
     function init() {
-        // At document-start (before the site reads its name list, on desktop):
-        // write this chapter's active $X=X set so the site applies the keeps.
+        // document-start: record storage state for the debug row. Story
+        // storage is only ever written on user command (Áp dụng / add
+        // buttons) — automatic writes raced the site's late content load
+        // on mobile and clobbered manual additions.
         try {
-            applyBudgetToStoryStorage();
+            recordStorageProbe();
+            localStorage.removeItem('STV_ACTIVE_CACHE'); // legacy auto-apply cache
         } catch (e) {
-            console.error('STV-Learn: auto-apply failed', e);
+            reportError('Khởi tạo thất bại', e);
         }
 
         const start = () => {
