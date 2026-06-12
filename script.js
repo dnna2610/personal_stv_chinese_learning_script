@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -149,7 +149,7 @@
     function freshDB() {
         return {
             version: 1,
-            settings: { budget: DEFAULT_BUDGET, autoApply: true, showKnown: true, disabledStories: [] },
+            settings: { budget: DEFAULT_BUDGET, autoApply: false, autoApplyV: 2, showKnown: true, disabledStories: [] },
             phrases: {}
         };
     }
@@ -157,7 +157,14 @@
     function normalizeDB(db) {
         db.settings = db.settings || {};
         if (typeof db.settings.budget !== 'number') db.settings.budget = DEFAULT_BUDGET;
-        if (typeof db.settings.autoApply !== 'boolean') db.settings.autoApply = true;
+        if (typeof db.settings.autoApply !== 'boolean') db.settings.autoApply = false;
+        // One-time: force auto OFF for DBs that got autoApply=true as the
+        // v2.4/2.5 default — auto is opt-in (thử nghiệm) until the site's
+        // rendering behaviour is understood.
+        if (db.settings.autoApplyV !== 2) {
+            db.settings.autoApply = false;
+            db.settings.autoApplyV = 2;
+        }
         if (typeof db.settings.showKnown !== 'boolean') db.settings.showKnown = true;
         if (!Array.isArray(db.settings.disabledStories)) db.settings.disabledStories = [];
         return db;
@@ -614,8 +621,10 @@
             const knownNote = (db.settings.showKnown && sel.knownPresent)
                 ? ` + ${sel.knownPresent} đã thuộc` : '';
             showNotification(
-                `Đã áp dụng ${learning.length}/${sel.learningPresent} cụm đang học${knownNote}` +
-                (reRendered || !changed ? ' — đang hiển thị' : ' — tải lại trang (F5) để hiển thị'),
+                `Đã lưu ${learning.length}/${sel.learningPresent} cụm đang học${knownNote}` +
+                (!changed ? ' — đang hiển thị đủ'
+                    : reRendered ? ' — nếu chưa hiện, thử nút Chạy / tải lại trang (F5)'
+                    : ' — tải lại trang (F5) để hiển thị'),
                 'success'
             );
         }
@@ -1162,7 +1171,7 @@
             </label>
             <label class="stv-panel-row">
                 <input type="checkbox" id="stv-auto-toggle" ${db.settings.autoApply ? 'checked' : ''}>
-                Tự động áp dụng (hiện ngay trong chương)
+                Tự động áp dụng (thử nghiệm)
             </label>
             <div class="stv-panel-row stv-panel-buttons">
                 <button id="stv-apply-btn" title="Chọn cụm theo budget cho chương này và lưu vào kho — tải lại trang để hiển thị">Áp dụng</button>
@@ -1174,7 +1183,7 @@
             </div>
             <div class="stv-panel-row" id="stv-chapter-overview"></div>
             <div class="stv-panel-row" id="stv-debug-row"></div>
-            <div class="stv-panel-hint">Tự động: cụm được chọn và hiển thị ngay sau khi chương tải xong (~2 giây). Bấm <b>Áp dụng</b> để ép chọn lại. Mệt thì kéo slider xuống.</div>
+            <div class="stv-panel-hint">Bấm <b>Áp dụng</b> để chọn cụm cho chương này — nếu chưa hiện, thử nút <b>Chạy</b> rồi tải lại trang (F5). Mệt thì kéo slider xuống.</div>
         `;
         document.body.appendChild(panelEl);
 
@@ -1208,7 +1217,7 @@
             refreshNewHighlight();
             const singleNote = !isMaterializable(value) ? ' (1 ký tự: chỉ Anki + nhận diện)' : '';
             showNotification(result === 'added'
-                ? `Đã thêm "${value}"${singleNote}${shownNow ? ' — đang hiển thị' : ' — tải lại trang để hiển thị'}`
+                ? `Đã thêm "${value}"${singleNote}${shownNow ? ' — nếu chưa hiện, tải lại trang (F5)' : ' — tải lại trang để hiển thị'}`
                 : `"${value}" đã có trong kho`, result === 'added' ? 'success' : 'info');
         };
         panelEl.querySelector('#stv-manual-btn').addEventListener('click', submitManual);
@@ -1255,7 +1264,7 @@
             db2.settings.autoApply = e.target.checked;
             saveDB(db2);
             showNotification(e.target.checked
-                ? 'Tự động áp dụng BẬT — cụm được chọn và hiển thị ngay sau khi chương tải xong'
+                ? 'Tự động áp dụng BẬT (thử nghiệm) — cụm được chọn sau khi chương tải xong'
                 : 'Tự động áp dụng TẮT — dùng nút Áp dụng', 'info');
         });
 
@@ -1362,8 +1371,17 @@
             ? '<b style="color:#C62828">localStorage (fallback!)</b>'
             : 'IndexedDB ✓';
 
+        // Are the site's render functions even visible to us? If excute is
+        // missing, every re-render attempt has been a silent no-op.
+        let siteFns = '';
+        try {
+            siteFns = `excute: <b>${typeof excute === 'function' ? '✓' : 'KHÔNG CÓ'}</b>` +
+                ` · saveNS: <b>${typeof saveNS === 'function' ? '✓' : 'KHÔNG CÓ'}</b>`;
+        } catch (e) { siteFns = 'site fns: lỗi'; }
+
         el.innerHTML =
             `<b>Debug</b> · key: <code>${DBG.storyKeyAtStart || '—'}</code>` +
+            `<br>${siteFns}` +
             `<br>Lưu sống sót qua reload: <b>${persist}</b> · DB học: ${dbHome}` +
             `<br>localStorage: <b>${usage}</b>` +
             (topKeys ? `<br>Key lớn nhất: ${topKeys}` : '') +
@@ -2159,7 +2177,7 @@
         const singleNote = !isMaterializable(chineseText)
             ? ' (1 ký tự: chỉ truyện này + Anki, không tự lan)'
             : '';
-        showNotification(`Added "${chineseText}"${isNew ? ' (+learn DB)' : ''}${singleNote}${shownNow ? ' — đang hiển thị!' : ' — tải lại trang để hiển thị!'}`, 'success');
+        showNotification(`Added "${chineseText}"${isNew ? ' (+learn DB)' : ''}${singleNote}${shownNow ? ' — nếu chưa hiện, tải lại trang (F5)!' : ' — tải lại trang để hiển thị!'}`, 'success');
     }
 
     /**
