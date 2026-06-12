@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.9
+// @version      2.10
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -1941,7 +1941,6 @@
 
     function applyNewHighlight() {
         const collected = collectedSet();
-        const nameSet = storyNameSet(getLocalStorageKeyFromURL());
         // Characters you already have, from every collected phrase.
         const knownChars = new Set();
         collected.forEach(p => {
@@ -1951,8 +1950,8 @@
         let count = 0;
         document.querySelectorAll('i[t]').forEach(el => {
             const t = (el.getAttribute('t') || '').trim();
-            // Only Chinese segments, not already collected or named.
-            if (!t || collected.has(t) || nameSet.has(t)) return;
+            // Only Chinese segments, not already collected.
+            if (!t || collected.has(t)) return;
             if (!/[一-鿿]/.test(t)) return;
             // Highlight ONLY phrases with a character you don't have yet.
             // All-known-character phrases are Scan's job, not yours.
@@ -2054,9 +2053,6 @@
         parseStorageEntries(localStorage.getItem(storageKey)).forEach(entry => {
             if (entry.isSelf && entry.left) collected.add(entry.left);
         });
-        // Phrases the user named ($X=Y) are not vocabulary candidates —
-        // they keep rendering as the chosen Vietnamese name.
-        const nameSet = storyNameSet(storageKey);
 
         const knownChars = new Set();
         collected.forEach(p => {
@@ -2079,7 +2075,7 @@
         // Pass 1: whole segments that qualify on their own.
         segments.forEach(el => {
             const t = segText(el);
-            if (!t || collected.has(t) || nameSet.has(t) || !isMaterializable(t)) return;
+            if (!t || collected.has(t) || !isMaterializable(t)) return;
             if (allKnown(t)) candidates.add(t);
         });
 
@@ -2092,7 +2088,7 @@
         });
 
         const tryMerge = merged => {
-            if (!merged || collected.has(merged) || candidates.has(merged) || nameSet.has(merged)) return;
+            if (!merged || collected.has(merged) || candidates.has(merged)) return;
             if ([...merged].length > MAX_MERGED_CHARS || !allKnown(merged)) return;
             candidates.add(merged);
         };
