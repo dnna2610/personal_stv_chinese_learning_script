@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -54,24 +54,26 @@
     // Learning DB
     //
     // Master vocabulary store, independent of the site's per-story name
-    // storages. The story storage is treated as a render target: when the
-    // user presses "Áp dụng", a budgeted subset of phrases (present in the
-    // current chapter) is materialized into it as $X=X entries. The site
-    // then renders that subset on the next page load — names take effect
-    // on chapter load, which is the site's native behavior. Writes are
-    // user-triggered only; automatic writes raced the site's late content
-    // load on mobile.
+    // storages. The story storage is treated as a render target: a budgeted
+    // subset of phrases (present in the current chapter) is materialized
+    // into it as $X=X entries — automatically after each chapter renders
+    // (taking effect from the next chapter load, the site's native name
+    // behavior), or immediately via the "Áp dụng" button + reload. Writes
+    // only ever happen AFTER the site has read storage and rendered, so
+    // they cannot race the site's late content load on mobile.
     //
     // Shape:
     // {
     //   version: 1,
-    //   settings: { budget: 15, disabledStories: [] },
+    //   settings: { budget: 15, autoApply: true, disabledStories: [] },
     //   phrases: {
     //     "修炼": { added: "2026-06-11", status: "learning"|"known",
     //               exposures: 0, lapses: 0, lastSeen: "2026-06-11"|null,
-    //               hv: "tu luyện", meaning: "" }
+    //               hv: "tu luyện", meaning: "", manual: true? }
     //   }
     // }
+    // `manual` marks phrases the user typed in explicitly (vs. Scan/import)
+    // so they outrank the never-seen backlog when filling the budget.
     // hv (Hán-Việt reading) is harvested from the site's <i h="..."> the
     // first time a phrase is seen. The legacy `meaning` field is unused —
     // meanings now come from CC-CEDICT (IndexedDB), since the site's v
@@ -102,6 +104,10 @@
 
     let dbMem = null;          // in-memory DB — single source of truth
     let learnIdbBroken = false; // IndexedDB failed → localStorage fallback
+    // True once the authoritative DB is loaded. Storage writes that depend
+    // on DB content (auto/manual apply, scan) must wait for this — running
+    // them against the empty bootstrap DB would strip the story's $X=X set.
+    let dbReady = false;
 
     const LEARN_IDB = 'STV_LEARN_IDB';
     const LEARN_STORE = 'kv';
@@ -144,7 +150,7 @@
     function freshDB() {
         return {
             version: 1,
-            settings: { budget: DEFAULT_BUDGET, showKnown: true, disabledStories: [] },
+            settings: { budget: DEFAULT_BUDGET, autoApply: true, showKnown: true, disabledStories: [] },
             phrases: {}
         };
     }
@@ -152,6 +158,7 @@
     function normalizeDB(db) {
         db.settings = db.settings || {};
         if (typeof db.settings.budget !== 'number') db.settings.budget = DEFAULT_BUDGET;
+        if (typeof db.settings.autoApply !== 'boolean') db.settings.autoApply = true;
         if (typeof db.settings.showKnown !== 'boolean') db.settings.showKnown = true;
         if (!Array.isArray(db.settings.disabledStories)) db.settings.disabledStories = [];
         return db;
@@ -230,17 +237,41 @@
                 // Changes made this session before IndexedDB resolved win.
                 stored.phrases = Object.assign({}, stored.phrases, dbMem.phrases);
             }
-            dbMem = normalizeDB(stored);
+            stored = normalizeDB(stored);
+
+            // One-time: fold the legacy global $X=X store into the DB and
+            // delete it — it duplicated the DB and cost ~86KB of the
+            // localStorage quota the site already fills.
+            try {
+                const legacyGlobal = localStorage.getItem(GLOBAL_KEY);
+                if (legacyGlobal !== null) {
+                    parseStorageEntries(legacyGlobal).forEach(en => {
+                        if (en.isSelf && en.left) dbAddPhrase(stored, en.left);
+                    });
+                    localStorage.removeItem(GLOBAL_KEY);
+                }
+            } catch (e) {
+                reportError('Gộp CHINESE_CHARACTERS thất bại', e);
+            }
+
+            dbMem = stored;
+            dbReady = true;
             await learnIdbPut(dbMem);
             localStorage.removeItem(DB_KEY); // reclaim quota headroom
-            if (panelEl) updatePanelStats();
         } catch (e) {
             learnIdbBroken = true;
+            dbReady = true; // localStorage copy is authoritative in fallback
             reportError('IndexedDB không dùng được — DB học dùng localStorage', e);
         }
+        // Content may have rendered while the DB was loading — rerun the
+        // chapter passes now that writes are allowed (no-ops without text).
+        try { autoApplyChapter(); } catch (e) { reportError('Tự động áp dụng thất bại', e); }
+        try { updateChapterDiagnostics(); } catch (e) { /* observer will retry */ }
+        try { annotateRenderedPhrases(); } catch (e) { /* observer will retry */ }
+        if (panelEl) updatePanelStats();
     }
 
-    function dbAddPhrase(db, phrase) {
+    function dbAddPhrase(db, phrase, manual) {
         phrase = phrase.trim();
         if (!phrase || db.phrases[phrase]) return false;
         db.phrases[phrase] = {
@@ -252,6 +283,7 @@
             hv: '',
             meaning: ''
         };
+        if (manual) db.phrases[phrase].manual = true;
         return true;
     }
 
@@ -300,6 +332,11 @@
             const seenB = ib.lastSeen || '';
             if (seenA !== seenB) return seenA < seenB ? -1 : 1; // '' (never) first
             if (ia.exposures !== ib.exposures) return ia.exposures - ib.exposures;
+            // Explicit user adds outrank bulk Scan/import adds — typing a
+            // phrase in is a request to see it, even on a day Scan added
+            // dozens of others with the same date.
+            const mA = ia.manual ? 1 : 0, mB = ib.manual ? 1 : 0;
+            if (mA !== mB) return mB - mA;
             // Among equally-unseen phrases, most recently ADDED first — a
             // phrase added today (manual/scan) should surface now, not queue
             // behind thousands of never-seen backlog imports.
@@ -475,8 +512,36 @@
      * so the user reloads when ready. Entirely user-triggered: no race
      * with the site's late content load on mobile.
      */
+    /**
+     * AUTO apply (v2): runs after the chapter has fully rendered and writes
+     * the presence-optimized set for the NEXT load of a chapter — the
+     * site's native "names apply on next chapter load" model. Unlike the
+     * old auto-apply there is no document-start write and no per-chapter
+     * cache, so there is nothing to race the site's late content load on
+     * mobile: by the time this runs, the site has already read storage.
+     */
+    function autoApplyChapter() {
+        if (!dbReady) return; // never write from the empty bootstrap DB
+        const db = loadDB();
+        if (!db.settings.autoApply) return;
+        const storyKey = getLocalStorageKeyFromURL();
+        if (!storyKey || db.settings.disabledStories.includes(storyKey)) return;
+        const text = reconstructChapterText();
+        if (!text) return;
+
+        const sel = selectActiveForChapter(db, text);
+        writeActiveToStorage(storyKey, sel.active);
+        DBG.lastWriteCount = sel.active.length;
+        DBG.selfCountAfterWrite = parseStorageEntries(localStorage.getItem(storyKey))
+            .filter(e => e.isSelf).length;
+    }
+
     function applyBudgetNow() {
         try {
+            if (!dbReady) {
+                showNotification('DB học đang tải — đợi 1–2 giây rồi bấm lại', 'error');
+                return;
+            }
             const storyKey = getLocalStorageKeyFromURL();
             if (!storyKey) {
                 showNotification('Không xác định được key truyện từ URL', 'error');
@@ -614,9 +679,11 @@
         const schedule = () => {
             clearTimeout(timer);
             timer = setTimeout(() => {
-                // READ-ONLY passes: report chapter state, then annotate /
-                // harvest the rendered keeps. Each step isolated: one
-                // failing must not silently kill the other.
+                // Auto-apply writes the set for the NEXT chapter load, then
+                // the read-only passes report state and annotate/harvest the
+                // rendered keeps. Each step isolated: one failing must not
+                // silently kill the others.
+                try { autoApplyChapter(); } catch (e) { reportError('Tự động áp dụng thất bại', e); }
                 try { updateChapterDiagnostics(); } catch (e) { reportError('Đọc trạng thái chương thất bại', e); }
                 try { annotateRenderedPhrases(); } catch (e) { reportError('Đánh dấu cụm thất bại', e); }
             }, 1500);
@@ -762,7 +829,7 @@
 
         if (action === 'promote') {
             info.status = 'known';
-            showNotification(`"${phrase}" → đã thuộc. Slot trống cho từ mới — bấm Áp dụng khi muốn!`, 'success');
+            showNotification(`"${phrase}" → đã thuộc. Slot trống cho từ mới từ chương kế!`, 'success');
         } else if (action === 'demote') {
             info.status = 'learning';
             showNotification(`"${phrase}" → học lại`, 'info');
@@ -1036,6 +1103,10 @@
                 <input type="checkbox" id="stv-story-toggle" ${storyDisabled ? '' : 'checked'}>
                 Bật học cho truyện này
             </label>
+            <label class="stv-panel-row">
+                <input type="checkbox" id="stv-auto-toggle" ${db.settings.autoApply ? 'checked' : ''}>
+                Tự động áp dụng (hiệu lực từ chương kế)
+            </label>
             <div class="stv-panel-row stv-panel-buttons">
                 <button id="stv-apply-btn" title="Chọn cụm theo budget cho chương này và lưu vào kho — tải lại trang để hiển thị">Áp dụng</button>
                 <button id="stv-export-btn" title="Copy TSV (chữ, pinyin, Hán Việt, nghĩa) để import vào Anki">Xuất Anki</button>
@@ -1046,7 +1117,7 @@
             </div>
             <div class="stv-panel-row" id="stv-chapter-overview"></div>
             <div class="stv-panel-row" id="stv-debug-row"></div>
-            <div class="stv-panel-hint">Bấm <b>Áp dụng</b> để chọn cụm cho chương này, rồi tải lại trang để hiển thị. Mệt thì kéo slider xuống.</div>
+            <div class="stv-panel-hint">Tự động: cụm được chọn sau khi đọc, hiệu lực từ chương kế. Bấm <b>Áp dụng</b> + tải lại trang để áp cho chương này ngay. Mệt thì kéo slider xuống.</div>
         `;
         document.body.appendChild(panelEl);
 
@@ -1058,7 +1129,7 @@
             const db2 = loadDB();
             db2.settings.budget = parseInt(slider.value, 10);
             saveDB(db2);
-            showNotification(`Budget: ${slider.value} cụm — bấm Áp dụng để dùng`, 'info');
+            showNotification(`Budget: ${slider.value} cụm — hiệu lực từ chương kế (hoặc bấm Áp dụng)`, 'info');
             updatePanelStats();
         });
 
@@ -1089,8 +1160,8 @@
             db2.settings.showKnown = e.target.checked;
             saveDB(db2);
             showNotification(e.target.checked
-                ? 'Cụm đã thuộc sẽ hiển thị (bấm Áp dụng để cập nhật)'
-                : 'Ẩn cụm đã thuộc — slider 0 = tắt hẳn (bấm Áp dụng để cập nhật)', 'info');
+                ? 'Cụm đã thuộc sẽ hiển thị (từ chương kế, hoặc bấm Áp dụng)'
+                : 'Ẩn cụm đã thuộc — slider 0 = tắt hẳn (từ chương kế, hoặc bấm Áp dụng)', 'info');
             updatePanelStats();
         });
 
@@ -1116,6 +1187,15 @@
             showNotification(e.target.checked
                 ? 'Bật học cho truyện này — bấm Áp dụng để chọn cụm'
                 : 'Tắt học cho truyện này — chữ Trung sẽ biến mất sau khi tải lại', 'info');
+        });
+
+        panelEl.querySelector('#stv-auto-toggle').addEventListener('change', e => {
+            const db2 = loadDB();
+            db2.settings.autoApply = e.target.checked;
+            saveDB(db2);
+            showNotification(e.target.checked
+                ? 'Tự động áp dụng BẬT — cụm được chọn sau mỗi chương, hiệu lực từ chương kế'
+                : 'Tự động áp dụng TẮT — dùng nút Áp dụng', 'info');
         });
 
         panelEl.querySelector('#stv-panel-close').addEventListener('click', togglePanel);
@@ -1726,7 +1806,7 @@
         phrase = (phrase || '').trim();
         if (!phrase) return 'empty';
         const db = loadDB();
-        const added = dbAddPhrase(db, phrase);
+        const added = dbAddPhrase(db, phrase, true);
         const seg = [...document.querySelectorAll('i[t]')].find(el =>
             (el.getAttribute('t') || '').trim() === phrase
         );
@@ -1752,12 +1832,11 @@
         const db = loadDB();
         const collected = new Set(Object.keys(db.phrases));
         const storyKey = getLocalStorageKeyFromURL();
-        [storyKey, GLOBAL_KEY].forEach(key => {
-            if (!key) return;
-            parseStorageEntries(localStorage.getItem(key)).forEach(entry => {
+        if (storyKey) {
+            parseStorageEntries(localStorage.getItem(storyKey)).forEach(entry => {
                 if (entry.isSelf && entry.left) collected.add(entry.left);
             });
-        });
+        }
         return collected;
     }
 
@@ -1860,6 +1939,10 @@
     }
 
     function doScanAndCollect() {
+        if (!dbReady) {
+            showNotification('DB học đang tải — đợi 1–2 giây rồi bấm lại', 'error');
+            return;
+        }
         const storageKey = getLocalStorageKeyFromURL();
         if (!storageKey) {
             showNotification('Could not determine localStorage key from URL', 'error');
@@ -1868,10 +1951,8 @@
 
         const db = loadDB();
         const collected = new Set(Object.keys(db.phrases));
-        [storageKey, GLOBAL_KEY].forEach(key => {
-            parseStorageEntries(localStorage.getItem(key)).forEach(entry => {
-                if (entry.isSelf && entry.left) collected.add(entry.left);
-            });
+        parseStorageEntries(localStorage.getItem(storageKey)).forEach(entry => {
+            if (entry.isSelf && entry.left) collected.add(entry.left);
         });
 
         const knownChars = new Set();
@@ -1941,7 +2022,7 @@
             showNotification(`Tìm thấy ${added} cụm mới nhưng LƯU THẤT BẠI — xem Debug trong bảng Học`, 'error');
             return;
         }
-        showNotification(`Đã thêm ${added} cụm mới vào DB học — bấm Áp dụng để hiển thị theo budget`, 'success');
+        showNotification(`Đã thêm ${added} cụm mới vào DB học — hiệu lực từ chương kế (hoặc bấm Áp dụng)`, 'success');
 
         // Harvest hv/meaning for the new phrases from this chapter's
         // <i h= v=> attributes right away.
@@ -1982,30 +2063,12 @@
 
         // Record in the learning DB (master store).
         const db = loadDB();
-        const isNew = dbAddPhrase(db, chineseText);
+        const isNew = dbAddPhrase(db, chineseText, true);
         saveDB(db);
         updatePanelStats();
 
         let currentValue = localStorage.getItem(storageKey) || '';
         const newEntry = `$${chineseText}=${chineseText}`;
-
-        let globalValue = localStorage.getItem(GLOBAL_KEY) || '';
-        if (!globalValue.includes(newEntry)) {
-            if (globalValue) {
-                globalValue = globalValue.replace(/~\/\/~$/, '');
-                globalValue += `~//~${newEntry}~//~`;
-            } else {
-                globalValue = `${newEntry}~//~`;
-            }
-            const globalEntries = globalValue.split('~//~').filter(entry => entry.trim());
-            globalEntries.sort((a, b) => {
-                const aMatch = a.match(/^\$(.+)=(.+)$/);
-                const bMatch = b.match(/^\$(.+)=(.+)$/);
-                if (aMatch && bMatch) return aMatch[1].length - bMatch[1].length;
-                return a.length - b.length;
-            });
-            localStorage.setItem(GLOBAL_KEY, globalEntries.join('~//~') + '~//~');
-        }
 
         if (currentValue.includes(newEntry)) {
             showNotification(
