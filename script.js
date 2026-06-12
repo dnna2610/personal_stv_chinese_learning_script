@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -16,24 +16,12 @@
     'use strict';
 
     // =====================================================================
-    // iOS storage diagnostics (captured at script start, before anything
-    // touches storage). Two independent probes:
-    //   1. PERSIST PROBE — a counter on a key the SITE never touches. If it
-    //      increments across reloads, our localStorage writes survive at all
-    //      (not sandboxed by Stay). If it stays 0/blank, our writes never
-    //      reach the page's storage → storage approach is impossible.
-    //   2. CLOBBER PROBE — the count of $X=X entries the story key held when
-    //      we arrived this load, i.e. what the SITE preserved from our last
-    //      write. If our last-write count > this, the site clobbered us.
+    // Diagnostics shown in the panel's debug row. CLOBBER PROBE: the count
+    // of $X=X entries the story key held when we arrived this load, i.e.
+    // what the SITE preserved from our last write — if our last-write
+    // count > this, the site clobbered us.
     // =====================================================================
-    const DBG = { persistPrev: null, persistOK: null, storyKeyAtStart: null, selfCountAtStart: null, selfCountAfterWrite: null, lastWriteCount: null, syncSkipped: null, errors: [] };
-    try {
-        const raw = localStorage.getItem('STV_PERSIST_PROBE');
-        DBG.persistPrev = raw === null ? null : parseInt(raw, 10);
-        DBG.persistOK = (raw !== null && !isNaN(DBG.persistPrev));
-        const next = (DBG.persistOK ? DBG.persistPrev : 0) + 1;
-        localStorage.setItem('STV_PERSIST_PROBE', String(next));
-    } catch (e) { /* storage unavailable */ }
+    const DBG = { storyKeyAtStart: null, selfCountAtStart: null, selfCountAfterWrite: null, lastWriteCount: null, syncSkipped: null, errors: [] };
 
     /**
      * Surface a caught failure to the user. There is no console on iOS, so
@@ -1341,10 +1329,6 @@
         const el = panelEl.querySelector('#stv-debug-row');
         if (!el) return;
 
-        const persist = DBG.persistOK
-            ? `OK (lần ${DBG.persistPrev})`
-            : (DBG.persistPrev === null ? 'CHƯA (lần đầu)' : 'LỖI');
-
         // Current $X=X count in story storage right now (post-site-activity).
         let nowCount = '—';
         if (DBG.storyKeyAtStart) {
@@ -1355,23 +1339,15 @@
         const fmt = v => (v === null || v === undefined) ? '—' : v;
         const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
 
-        // localStorage usage, total + biggest keys — quota trouble
-        // (iOS ~5MB) and WHO is hogging it both show up here.
-        let usage = '—', topKeys = '';
+        // Total localStorage usage — quota trouble (iOS ~5MB) shows here.
+        let usage = '—';
         try {
-            const sizes = [];
             let chars = 0;
             for (let i = 0; i < localStorage.length; i++) {
                 const k = localStorage.key(i);
-                const n = k.length + (localStorage.getItem(k) || '').length;
-                chars += n;
-                sizes.push([k, n]);
+                chars += k.length + (localStorage.getItem(k) || '').length;
             }
             usage = Math.round(chars * 2 / 1024) + ' KB';
-            sizes.sort((a, b) => b[1] - a[1]);
-            topKeys = sizes.slice(0, 4)
-                .map(([k, n]) => `${esc(k.length > 24 ? k.slice(0, 24) + '…' : k)} ${Math.round(n * 2 / 1024)}KB`)
-                .join(' · ');
         } catch (e) { /* leave dash */ }
 
         const dbHome = learnIdbBroken
@@ -1382,17 +1358,14 @@
         // missing, every re-render attempt has been a silent no-op.
         let siteFns = '';
         try {
-            siteFns = `excute: <b>${typeof excute === 'function' ? '✓' : 'KHÔNG CÓ'}</b>` +
-                ` · saveNS: <b>${typeof saveNS === 'function' ? '✓' : 'KHÔNG CÓ'}</b>`;
+            siteFns = `excute <b>${typeof excute === 'function' ? '✓' : 'KHÔNG CÓ'}</b>` +
+                ` · saveNS <b>${typeof saveNS === 'function' ? '✓' : 'KHÔNG CÓ'}</b>`;
         } catch (e) { siteFns = 'site fns: lỗi'; }
 
         el.innerHTML =
-            `<b>Debug</b> · key: <code>${DBG.storyKeyAtStart || '—'}</code>` +
-            `<br>${siteFns}` +
-            `<br>Lưu sống sót qua reload: <b>${persist}</b> · DB học: ${dbHome}` +
-            `<br>localStorage: <b>${usage}</b>` +
-            (topKeys ? `<br>Key lớn nhất: ${topKeys}` : '') +
-            `<br>$X=X lúc vào: <b>${fmt(DBG.selfCountAtStart)}</b> · sau khi ghi: <b>${fmt(DBG.selfCountAfterWrite)}</b> · bây giờ: <b>${nowCount}</b> (đã ghi ${fmt(DBG.lastWriteCount)})` +
+            `<b>Debug</b> · <code>${DBG.storyKeyAtStart || '—'}</code> · DB: ${dbHome}` +
+            `<br>${siteFns} · localStorage: <b>${usage}</b>` +
+            `<br>$X=X lúc vào: <b>${fmt(DBG.selfCountAtStart)}</b> · sau ghi: <b>${fmt(DBG.selfCountAfterWrite)}</b> · giờ: <b>${nowCount}</b> (đã ghi ${fmt(DBG.lastWriteCount)})` +
             (DBG.syncSkipped ? `<br>Chẩn đoán chương bỏ qua: <b>${esc(DBG.syncSkipped)}</b>` : '') +
             (DBG.errors.length
                 ? `<br><span style="color:#C62828">Lỗi gần đây:<br>${DBG.errors.slice(-3).map(esc).join('<br>')}</span>`
@@ -1558,6 +1531,13 @@
                 bottom: 80px;
                 right: 28px;
                 width: 290px;
+                /* Anchored at the bottom and growing upward — cap the
+                   height so the title/close never escape past the screen
+                   top; the panel scrolls internally instead. */
+                max-height: calc(100vh - 110px);
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
+                overscroll-behavior: contain;
                 background: #FAFAFA;
                 color: #212121;
                 border: 1px solid #BDBDBD;
@@ -1569,8 +1549,15 @@
                 box-shadow: 0 4px 16px rgba(0,0,0,0.25);
             }
             #stv-learn-panel .stv-panel-title {
-                font-weight: bold; font-size: 14px; margin-bottom: 8px;
+                font-weight: bold; font-size: 14px;
                 display: flex; justify-content: space-between;
+                /* Stays pinned while the panel scrolls so ✕ is reachable. */
+                position: sticky;
+                top: -12px;
+                margin: -12px -12px 8px;
+                padding: 12px 12px 8px;
+                background: #FAFAFA;
+                z-index: 1;
             }
             #stv-learn-panel #stv-panel-close { cursor: pointer; color: #757575; }
             #stv-learn-panel .stv-panel-row { display: block; margin-bottom: 8px; }
@@ -1658,7 +1645,10 @@
                     right: 8px;
                     width: auto;
                     bottom: 130px;
+                    max-height: calc(100vh - 160px);
                 }
+                #stv-learn-panel .stv-panel-row { margin-bottom: 6px; }
+                #stv-learn-panel .stv-overview-chips { max-height: 96px; }
             }
         `;
         document.head.appendChild(style);
@@ -2381,7 +2371,8 @@
         // on mobile and clobbered manual additions.
         try {
             recordStorageProbe();
-            localStorage.removeItem('STV_ACTIVE_CACHE'); // legacy auto-apply cache
+            localStorage.removeItem('STV_ACTIVE_CACHE');  // legacy auto-apply cache
+            localStorage.removeItem('STV_PERSIST_PROBE'); // legacy reload-survival probe
         } catch (e) {
             reportError('Khởi tạo thất bại', e);
         }
