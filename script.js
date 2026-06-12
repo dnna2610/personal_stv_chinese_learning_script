@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.8
+// @version      2.9
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -387,16 +387,33 @@
     }
 
     /**
+     * Lefts of real translation names ($X=Y, X≠Y) in this story's storage.
+     * Learn mode must never touch these: a phrase the user named keeps
+     * rendering as their chosen Vietnamese name, never as kept Chinese,
+     * and must not occupy a learning budget slot.
+     */
+    function storyNameSet(storyKey) {
+        const set = new Set();
+        if (!storyKey) return set;
+        parseStorageEntries(localStorage.getItem(storyKey)).forEach(e => {
+            if (!e.isSelf && e.left) set.add(e.left);
+        });
+        return set;
+    }
+
+    /**
      * Like selectActivePhrases, but restricted to phrases that actually
      * appear in this chapter's text — so budget slots aren't wasted on
-     * phrases absent from the chapter. Returns the full active list
-     * (known + budgeted learning) plus diagnostics.
+     * phrases absent from the chapter — and excluding phrases that are
+     * names in this story (see storyNameSet). Returns the full active
+     * list (known + budgeted learning) plus diagnostics.
      */
-    function selectActiveForChapter(db, text) {
+    function selectActiveForChapter(db, text, nameSet) {
         const known = [];
         const learning = [];
         Object.entries(db.phrases).forEach(([phrase, info]) => {
             if (!isMaterializable(phrase)) return;
+            if (nameSet && nameSet.has(phrase)) return; // named → Vietnamese
             if (!text.includes(phrase)) return; // present in this chapter only
             if (info.status === 'known') known.push(phrase);
             else learning.push(phrase);
@@ -562,7 +579,8 @@
             return false;
         }
 
-        const sel = selectActiveForChapter(db, text);
+        const nameSet = storyNameSet(storyKey);
+        const sel = selectActiveForChapter(db, text, nameSet);
 
         // Adopt the learning phrases the site is already rendering.
         const renderedNow = [];
@@ -570,6 +588,7 @@
         document.querySelectorAll('.contentbox i[t]').forEach(el => {
             const t = (el.getAttribute('t') || '').trim();
             if (!t || seenT.has(t) || el.textContent.trim() !== t) return;
+            if (nameSet.has(t)) return; // named → stays Vietnamese
             const info = db.phrases[t];
             if (info && info.status !== 'known' && isMaterializable(t)) {
                 seenT.add(t);
@@ -654,7 +673,7 @@
         const text = reconstructChapterText();
         if (!text) { DBG.syncSkipped = 'chưa thấy nội dung chương'; return; }
 
-        const sel = selectActiveForChapter(db, text);
+        const sel = selectActiveForChapter(db, text, storyNameSet(storyKey));
 
         const storedSelf = new Set(parseStorageEntries(localStorage.getItem(storyKey))
             .filter(e => e.isSelf).map(e => e.left));
@@ -1202,9 +1221,11 @@
             if (result === 'error') return; // saveDB already told the user
             manualInput.value = '';
             // Materialize the explicit add into this story right away and
-            // re-render so it shows immediately.
+            // re-render so it shows immediately — unless the phrase is a
+            // name here: the Vietnamese name stays.
+            const isName = storyNameSet(getLocalStorageKeyFromURL()).has(value);
             let shownNow = false;
-            if (result === 'added' && isMaterializable(value)) {
+            if (result === 'added' && isMaterializable(value) && !isName) {
                 appendSelfEntryToStory(value);
                 shownNow = siteReRender();
             }
@@ -1212,7 +1233,9 @@
             refreshNewHighlight();
             const singleNote = !isMaterializable(value) ? ' (1 ký tự: chỉ Anki + nhận diện)' : '';
             showNotification(result === 'added'
-                ? `Đã thêm "${value}"${singleNote}${shownNow ? ' — nếu chưa hiện, tải lại trang (F5)' : ' — tải lại trang để hiển thị'}`
+                ? (isName
+                    ? `Đã thêm "${value}" vào DB — nhưng đang là name tiếng Việt trong truyện này nên giữ nguyên`
+                    : `Đã thêm "${value}"${singleNote}${shownNow ? ' — nếu chưa hiện, tải lại trang (F5)' : ' — tải lại trang để hiển thị'}`)
                 : `"${value}" đã có trong kho`, result === 'added' ? 'success' : 'info');
         };
         panelEl.querySelector('#stv-manual-btn').addEventListener('click', submitManual);
@@ -1918,6 +1941,7 @@
 
     function applyNewHighlight() {
         const collected = collectedSet();
+        const nameSet = storyNameSet(getLocalStorageKeyFromURL());
         // Characters you already have, from every collected phrase.
         const knownChars = new Set();
         collected.forEach(p => {
@@ -1927,8 +1951,8 @@
         let count = 0;
         document.querySelectorAll('i[t]').forEach(el => {
             const t = (el.getAttribute('t') || '').trim();
-            // Only Chinese segments, not already collected.
-            if (!t || collected.has(t)) return;
+            // Only Chinese segments, not already collected or named.
+            if (!t || collected.has(t) || nameSet.has(t)) return;
             if (!/[一-鿿]/.test(t)) return;
             // Highlight ONLY phrases with a character you don't have yet.
             // All-known-character phrases are Scan's job, not yours.
@@ -2030,6 +2054,9 @@
         parseStorageEntries(localStorage.getItem(storageKey)).forEach(entry => {
             if (entry.isSelf && entry.left) collected.add(entry.left);
         });
+        // Phrases the user named ($X=Y) are not vocabulary candidates —
+        // they keep rendering as the chosen Vietnamese name.
+        const nameSet = storyNameSet(storageKey);
 
         const knownChars = new Set();
         collected.forEach(p => {
@@ -2052,7 +2079,7 @@
         // Pass 1: whole segments that qualify on their own.
         segments.forEach(el => {
             const t = segText(el);
-            if (!t || collected.has(t) || !isMaterializable(t)) return;
+            if (!t || collected.has(t) || nameSet.has(t) || !isMaterializable(t)) return;
             if (allKnown(t)) candidates.add(t);
         });
 
@@ -2065,7 +2092,7 @@
         });
 
         const tryMerge = merged => {
-            if (!merged || collected.has(merged) || candidates.has(merged)) return;
+            if (!merged || collected.has(merged) || candidates.has(merged) || nameSet.has(merged)) return;
             if ([...merged].length > MAX_MERGED_CHARS || !allKnown(merged)) return;
             candidates.add(merged);
         };
