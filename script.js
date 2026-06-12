@@ -290,6 +290,13 @@
         localStorage.setItem(ACTIVE_CACHE_KEY, JSON.stringify(cache));
     }
 
+    // Drop all cached chapter sets so they recompute — call after anything
+    // that changes which phrases should be active (e.g. promoting a phrase
+    // to "thuộc" frees a budget slot for a new learning phrase).
+    function invalidateActiveCache() {
+        localStorage.removeItem(ACTIVE_CACHE_KEY);
+    }
+
     /**
      * Materialize an active phrase list into the story's storage:
      *  - real translation names ($X=Y, X≠Y) are kept untouched
@@ -642,14 +649,17 @@
 
         if (action === 'promote') {
             info.status = 'known';
-            showNotification(`"${phrase}" → đã thuộc. Slot trống cho từ mới!`, 'success');
+            invalidateActiveCache(); // free the slot for a new learning phrase
+            showNotification(`"${phrase}" → đã thuộc. Slot trống cho từ mới (tải lại trang)!`, 'success');
         } else if (action === 'demote') {
             info.status = 'learning';
+            invalidateActiveCache();
             showNotification(`"${phrase}" → học lại`, 'info');
         } else if (action === 'lapse') {
             info.lapses++;
             info.lastSeen = null; // jump the queue at next chapter load
             if (info.status === 'known') info.status = 'learning';
+            invalidateActiveCache();
             showNotification(`"${phrase}" sẽ được ưu tiên hiện lại`, 'info');
         }
         saveDB(db);
