@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -26,7 +26,7 @@
     //      we arrived this load, i.e. what the SITE preserved from our last
     //      write. If our last-write count > this, the site clobbered us.
     // =====================================================================
-    const DBG = { persistPrev: null, persistOK: null, storyKeyAtStart: null, selfCountAtStart: null, selfCountAfterWrite: null, lastWriteCount: null };
+    const DBG = { persistPrev: null, persistOK: null, storyKeyAtStart: null, selfCountAtStart: null, selfCountAfterWrite: null, lastWriteCount: null, applySkipped: null, syncSkipped: null, errors: [] };
     try {
         const raw = localStorage.getItem('STV_PERSIST_PROBE');
         DBG.persistPrev = raw === null ? null : parseInt(raw, 10);
@@ -34,6 +34,21 @@
         const next = (DBG.persistOK ? DBG.persistPrev : 0) + 1;
         localStorage.setItem('STV_PERSIST_PROBE', String(next));
     } catch (e) { /* storage unavailable */ }
+
+    /**
+     * Surface a caught failure to the user. There is no console on iOS, so
+     * every error goes to a toast AND the panel's debug row — a silent
+     * failure here looks like "the button does nothing".
+     */
+    function reportError(context, e) {
+        const detail = e && e.name ? `${e.name}: ${e.message || ''}` : String(e);
+        const msg = `${context} — ${detail}`;
+        DBG.errors.push(msg);
+        if (DBG.errors.length > 5) DBG.errors.shift();
+        console.error('STV-Learn:', context, e);
+        try { showNotification(msg, 'error'); } catch (e2) { /* no DOM yet */ }
+        try { if (panelEl) updateDebugRow(); } catch (e2) { /* panel not built */ }
+    }
 
     // =====================================================================
     // Learning DB
@@ -98,8 +113,28 @@
         };
     }
 
+    /**
+     * Persist the learning DB. Returns false (after telling the user) when
+     * the write fails — typically QuotaExceededError on iOS. On quota
+     * pressure the re-computable chapter cache is dropped and the write
+     * retried once before giving up.
+     */
     function saveDB(db) {
-        localStorage.setItem(DB_KEY, JSON.stringify(db));
+        const json = JSON.stringify(db);
+        try {
+            localStorage.setItem(DB_KEY, json);
+            return true;
+        } catch (e) {
+            try {
+                localStorage.removeItem(ACTIVE_CACHE_KEY);
+                localStorage.setItem(DB_KEY, json);
+                reportError('Bộ nhớ gần đầy — đã dọn cache chương để lưu được', e);
+                return true;
+            } catch (e2) {
+                reportError('LƯU DB THẤT BẠI (thay đổi sẽ mất khi tải lại)', e2);
+                return false;
+            }
+        }
     }
 
     function dbAddPhrase(db, phrase) {
@@ -179,7 +214,13 @@
             const seenA = ia.lastSeen || '';
             const seenB = ib.lastSeen || '';
             if (seenA !== seenB) return seenA < seenB ? -1 : 1; // '' (never) first
-            return ia.exposures - ib.exposures;
+            if (ia.exposures !== ib.exposures) return ia.exposures - ib.exposures;
+            // Among equally-unseen phrases, most recently ADDED first — a
+            // phrase added today (manual/scan) should surface now, not queue
+            // behind thousands of never-seen backlog imports.
+            const addA = ia.added || '', addB = ib.added || '';
+            if (addA !== addB) return addA > addB ? -1 : 1;
+            return 0;
         };
     }
 
@@ -254,7 +295,9 @@
             active,
             knownPresent: known.length,
             learningActive: learningActive.length,
-            learningPresent: learning.length
+            learningPresent: learning.length,
+            knownList: known,
+            learningList: learning // SRS-ordered, present in this chapter
         };
     }
 
@@ -287,7 +330,11 @@
         if (keys.length > ACTIVE_CACHE_MAX) {
             keys.slice(0, keys.length - ACTIVE_CACHE_MAX).forEach(k => delete cache[k]);
         }
-        localStorage.setItem(ACTIVE_CACHE_KEY, JSON.stringify(cache));
+        try {
+            localStorage.setItem(ACTIVE_CACHE_KEY, JSON.stringify(cache));
+        } catch (e) {
+            reportError('Lưu cache chương thất bại', e);
+        }
     }
 
     // Drop all cached chapter sets so they recompute — call after anything
@@ -320,7 +367,51 @@
             const lb = b.left ? b.left.length : b.raw.length;
             return la - lb;
         });
-        localStorage.setItem(storyKey, all.length ? all.map(e => e.raw).join('~//~') + '~//~' : '');
+        try {
+            localStorage.setItem(storyKey, all.length ? all.map(e => e.raw).join('~//~') + '~//~' : '');
+        } catch (e) {
+            reportError('Ghi kho truyện thất bại', e);
+        }
+    }
+
+    /**
+     * Force a phrase into the CURRENT chapter's active set and story
+     * storage right away (explicit user add — allowed to exceed the
+     * budget). Without this, the chapter's cached active set — chosen
+     * before the add — would strip the new $X=X on its next rewrite and
+     * the phrase would silently vanish after one reload.
+     */
+    function addPhraseToChapterCache(phrase) {
+        if (!isMaterializable(phrase)) return;
+        const cache = loadActiveCache();
+        const entry = cache[window.location.pathname];
+        if (!entry || entry.active.includes(phrase)) return;
+        entry.active.push(phrase);
+        saveActiveCache(cache);
+    }
+
+    function appendSelfEntryToStory(phrase) {
+        const storyKey = getLocalStorageKeyFromURL();
+        if (!storyKey) return;
+        try {
+            const entries = parseStorageEntries(localStorage.getItem(storyKey));
+            if (entries.some(en => en.left === phrase)) return;
+            entries.push({ raw: `$${phrase}=${phrase}`, left: phrase });
+            entries.sort((a, b) => {
+                const la = a.left ? a.left.length : a.raw.length;
+                const lb = b.left ? b.left.length : b.raw.length;
+                return la - lb;
+            });
+            localStorage.setItem(storyKey, entries.map(en => en.raw).join('~//~') + '~//~');
+        } catch (e) {
+            reportError('Ghi kho truyện thất bại', e);
+        }
+    }
+
+    function forceActivateNow(phrase) {
+        if (!isMaterializable(phrase)) return;
+        addPhraseToChapterCache(phrase);
+        appendSelfEntryToStory(phrase);
     }
 
     /**
@@ -340,7 +431,10 @@
             .filter(e => e.isSelf).length;
 
         const db = loadDB();
-        if (!db.settings.autoApply || db.settings.disabledStories.includes(storyKey)) return;
+        if (!db.settings.autoApply || db.settings.disabledStories.includes(storyKey)) {
+            DBG.applySkipped = !db.settings.autoApply ? 'autoApply tắt' : 'truyện này bị tắt';
+            return;
+        }
         if (importFromNameStorages(db)) saveDB(db);
 
         const cache = loadActiveCache();
@@ -372,13 +466,17 @@
      * hint (the site applies on the next load when our write lost the race).
      */
     function syncChapterKeeps() {
+        DBG.syncSkipped = null;
         const storyKey = getLocalStorageKeyFromURL();
-        if (!storyKey) return;
+        if (!storyKey) { DBG.syncSkipped = 'không có key truyện'; return; }
         const db = loadDB();
-        if (!db.settings.autoApply || db.settings.disabledStories.includes(storyKey)) return;
+        if (!db.settings.autoApply || db.settings.disabledStories.includes(storyKey)) {
+            DBG.syncSkipped = !db.settings.autoApply ? 'autoApply tắt' : 'truyện này bị tắt';
+            return;
+        }
 
         const text = reconstructChapterText();
-        if (!text) return;
+        if (!text) { DBG.syncSkipped = 'chưa thấy nội dung chương'; return; }
 
         // Present phrases (for the count) and a fresh SRS pick (first visit).
         const sel = selectActiveForChapter(db, text);
@@ -398,6 +496,23 @@
                 text.includes(p) && isMaterializable(p) && db.phrases[p] &&
                 (db.phrases[p].status !== 'known' || db.settings.showKnown)
             );
+            // TOP UP: the cached set can only shrink above (and a cache
+            // poisoned by a partial first render may even be empty), so
+            // refill freed budget slots from this chapter's present
+            // phrases — otherwise a thin cache starves the chapter forever.
+            const have = new Set(active);
+            if (db.settings.showKnown) {
+                sel.knownList.forEach(p => {
+                    if (!have.has(p)) { have.add(p); active.push(p); }
+                });
+            }
+            let learningCount = active.filter(p =>
+                db.phrases[p].status !== 'known').length;
+            for (const p of sel.learningList) {
+                if (learningCount >= db.settings.budget) break;
+                if (have.has(p)) continue;
+                have.add(p); active.push(p); learningCount++;
+            }
         } else {
             active = sel.active;
         }
@@ -503,9 +618,10 @@
             clearTimeout(timer);
             timer = setTimeout(() => {
                 // Render keeps (storage + DOM safety-net) first, then count /
-                // harvest the now-fully-applied chapter.
-                syncChapterKeeps();
-                annotateRenderedPhrases();
+                // harvest the now-fully-applied chapter. Each step isolated:
+                // one failing must not silently kill the other.
+                try { syncChapterKeeps(); } catch (e) { reportError('Đồng bộ chương thất bại', e); }
+                try { annotateRenderedPhrases(); } catch (e) { reportError('Đánh dấu cụm thất bại', e); }
             }, 1500);
         };
         const observer = new MutationObserver(mutations => {
@@ -956,14 +1072,18 @@
         const submitManual = () => {
             const value = manualInput.value.trim();
             if (!value) return;
-            const added = learnAddPhrase(value);
+            const result = learnAddPhrase(value);
+            if (result === 'error') return; // saveDB already told the user
             manualInput.value = '';
+            // Materialize the explicit add into THIS chapter immediately —
+            // otherwise the chapter's cached active set strips it again.
+            if (result === 'added') forceActivateNow(value);
             updatePanelStats();
             refreshNewHighlight();
             const singleNote = !isMaterializable(value) ? ' (1 ký tự: chỉ Anki + nhận diện)' : '';
-            showNotification(added
-                ? `Đã thêm "${value}"${singleNote} — hiệu lực từ chương kế`
-                : `"${value}" đã có trong kho`, added ? 'success' : 'info');
+            showNotification(result === 'added'
+                ? `Đã thêm "${value}"${singleNote} — tải lại trang để hiện trong chương này`
+                : `"${value}" đã có trong kho`, result === 'added' ? 'success' : 'info');
         };
         panelEl.querySelector('#stv-manual-btn').addEventListener('click', submitManual);
         manualInput.addEventListener('keydown', e => {
@@ -1087,10 +1207,29 @@
                 .filter(e => e.isSelf).length;
         }
 
+        // Total localStorage usage — quota trouble (iOS ~5MB) shows up here.
+        let usage = '—';
+        try {
+            let chars = 0;
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                chars += k.length + (localStorage.getItem(k) || '').length;
+            }
+            usage = Math.round(chars * 2 / 1024) + ' KB';
+        } catch (e) { /* leave dash */ }
+
+        const fmt = v => (v === null || v === undefined) ? '—' : v;
+        const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
         el.innerHTML =
             `<b>Debug</b> · key: <code>${DBG.storyKeyAtStart || '—'}</code>` +
-            `<br>Lưu sống sót qua reload: <b>${persist}</b>` +
-            `<br>$X=X lúc vào: <b>${DBG.selfCountAtStart}</b> · sau khi ghi: <b>${DBG.selfCountAfterWrite}</b> · bây giờ: <b>${nowCount}</b> (đã ghi ${DBG.lastWriteCount})`;
+            `<br>Lưu sống sót qua reload: <b>${persist}</b> · dung lượng: <b>${usage}</b>` +
+            `<br>$X=X lúc vào: <b>${fmt(DBG.selfCountAtStart)}</b> · sau khi ghi: <b>${fmt(DBG.selfCountAfterWrite)}</b> · bây giờ: <b>${nowCount}</b> (đã ghi ${fmt(DBG.lastWriteCount)})` +
+            (DBG.applySkipped ? `<br>Auto-apply bỏ qua: <b>${esc(DBG.applySkipped)}</b>` : '') +
+            (DBG.syncSkipped ? `<br>Sync bỏ qua: <b>${esc(DBG.syncSkipped)}</b>` : '') +
+            (DBG.errors.length
+                ? `<br><span style="color:#C62828">Lỗi gần đây:<br>${DBG.errors.slice(-3).map(esc).join('<br>')}</span>`
+                : '');
     }
 
     /**
@@ -1453,7 +1592,21 @@
     /**
      * Show a temporary notification to the user
      */
+    const pendingNotifications = [];
+    function flushPendingNotifications() {
+        while (pendingNotifications.length && document.body) {
+            const [m, t] = pendingNotifications.shift();
+            showNotification(m, t);
+        }
+    }
+
     function showNotification(message, type = 'info') {
+        // document-start: no <body> yet — queue and show after DOM is ready.
+        if (!document.body) {
+            pendingNotifications.push([message, type]);
+            document.addEventListener('DOMContentLoaded', flushPendingNotifications, { once: true });
+            return;
+        }
         const notification = document.createElement('div');
         notification.textContent = message;
         notification.style.cssText = `
@@ -1569,7 +1722,7 @@
      */
     function learnAddPhrase(phrase) {
         phrase = (phrase || '').trim();
-        if (!phrase) return false;
+        if (!phrase) return 'empty';
         const db = loadDB();
         const added = dbAddPhrase(db, phrase);
         const seg = [...document.querySelectorAll('i[t]')].find(el =>
@@ -1580,8 +1733,8 @@
             const h = (seg.getAttribute('h') || '').trim();
             if (h && !info.hv) info.hv = h;
         }
-        saveDB(db);
-        return added;
+        if (!saveDB(db)) return 'error';
+        return added ? 'added' : 'exists';
     }
 
     /**
@@ -1695,6 +1848,16 @@
      * actually render as Chinese (from the next chapter load).
      */
     function scanAndCollect() {
+        // The button must ALWAYS answer — an uncaught error here used to
+        // look like "Scan does nothing".
+        try {
+            doScanAndCollect();
+        } catch (e) {
+            reportError('Scan thất bại', e);
+        }
+    }
+
+    function doScanAndCollect() {
         const storageKey = getLocalStorageKeyFromURL();
         if (!storageKey) {
             showNotification('Could not determine localStorage key from URL', 'error');
@@ -1768,10 +1931,14 @@
         candidates.forEach(p => {
             if (dbAddPhrase(db, p)) added++;
         });
-        saveDB(db);
+        const saved = saveDB(db);
         updatePanelStats();
 
         console.log('STV-Learn: scan collected', [...candidates].join(', '));
+        if (!saved) {
+            showNotification(`Tìm thấy ${added} cụm mới nhưng LƯU THẤT BẠI — xem Debug trong bảng Học`, 'error');
+            return;
+        }
         showNotification(`Đã thêm ${added} cụm mới vào DB học — hiệu lực từ chương kế`, 'success');
 
         // Harvest hv/meaning for the new phrases from this chapter's
@@ -1816,6 +1983,9 @@
         const isNew = dbAddPhrase(db, chineseText);
         saveDB(db);
         updatePanelStats();
+        // Explicit add → must also enter this chapter's cached active set,
+        // or the next sync's rewrite strips the $X=X entry written below.
+        addPhraseToChapterCache(chineseText);
 
         let currentValue = localStorage.getItem(storageKey) || '';
         const newEntry = `$${chineseText}=${chineseText}`;
@@ -1971,7 +2141,9 @@
             addButton.style.fontSize = '12px';
             addButton.innerHTML = '<i class="fas fa-plus"></i> Add';
             addButton.title = 'Add Chinese word to localStorage';
-            addButton.addEventListener('click', addChineseToLocalStorage);
+            addButton.addEventListener('click', () => {
+                try { addChineseToLocalStorage(); } catch (e) { reportError('Thêm từ thất bại', e); }
+            });
 
             const searchButton = zwRow.querySelector('button[onclick*="googlesearch"]');
             if (searchButton) {
@@ -2059,7 +2231,7 @@
         try {
             applyBudgetToStoryStorage();
         } catch (e) {
-            console.error('STV-Learn: auto-apply failed', e);
+            reportError('Auto-apply (document-start) thất bại', e);
         }
 
         const start = () => {
