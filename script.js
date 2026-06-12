@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -76,6 +76,15 @@
     // first time a phrase is seen. The legacy `meaning` field is unused —
     // meanings now come from CC-CEDICT (IndexedDB), since the site's v
     // attribute is unreliable vietphrase MT.
+    //
+    // STORAGE: the DB lives in IndexedDB (like the dictionary), NOT in
+    // localStorage — the site fills the ~5MB localStorage quota on iOS and
+    // a several-hundred-KB DB rewrite there fails with QuotaExceededError.
+    // A copy is kept in memory (dbMem) so all reads stay synchronous; saves
+    // write through to IndexedDB asynchronously. An old localStorage copy
+    // is migrated once and then deleted to reclaim quota headroom for the
+    // site's own keys. localStorage remains as fallback if IndexedDB is
+    // unavailable.
     // =====================================================================
 
     const DB_KEY = 'STV_LEARN_DB';
@@ -91,22 +100,48 @@
         return new Date().toISOString().slice(0, 10);
     }
 
-    function loadDB() {
-        try {
-            const raw = localStorage.getItem(DB_KEY);
-            if (raw) {
-                const db = JSON.parse(raw);
-                if (db && db.phrases) {
-                    db.settings = db.settings || {};
-                    if (typeof db.settings.budget !== 'number') db.settings.budget = DEFAULT_BUDGET;
-                    if (typeof db.settings.showKnown !== 'boolean') db.settings.showKnown = true;
-                    if (!Array.isArray(db.settings.disabledStories)) db.settings.disabledStories = [];
-                    return db;
+    let dbMem = null;          // in-memory DB — single source of truth
+    let learnIdbBroken = false; // IndexedDB failed → localStorage fallback
+
+    const LEARN_IDB = 'STV_LEARN_IDB';
+    const LEARN_STORE = 'kv';
+    let learnIdbPromise = null;
+
+    function openLearnIdb() {
+        if (learnIdbPromise) return learnIdbPromise;
+        learnIdbPromise = new Promise((resolve, reject) => {
+            const req = indexedDB.open(LEARN_IDB, 1);
+            req.onupgradeneeded = () => {
+                const idb = req.result;
+                if (!idb.objectStoreNames.contains(LEARN_STORE)) {
+                    idb.createObjectStore(LEARN_STORE);
                 }
-            }
-        } catch (e) {
-            console.error('STV-Learn: failed to parse DB, starting fresh', e);
-        }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+        return learnIdbPromise;
+    }
+
+    function learnIdbGet() {
+        return openLearnIdb().then(idb => new Promise((resolve, reject) => {
+            const tx = idb.transaction(LEARN_STORE, 'readonly');
+            const req = tx.objectStore(LEARN_STORE).get('db');
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error);
+        }));
+    }
+
+    function learnIdbPut(db) {
+        return openLearnIdb().then(idb => new Promise((resolve, reject) => {
+            const tx = idb.transaction(LEARN_STORE, 'readwrite');
+            tx.objectStore(LEARN_STORE).put(db, 'db');
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+        }));
+    }
+
+    function freshDB() {
         return {
             version: 1,
             settings: { budget: DEFAULT_BUDGET, showKnown: true, disabledStories: [] },
@@ -114,17 +149,94 @@
         };
     }
 
+    function normalizeDB(db) {
+        db.settings = db.settings || {};
+        if (typeof db.settings.budget !== 'number') db.settings.budget = DEFAULT_BUDGET;
+        if (typeof db.settings.showKnown !== 'boolean') db.settings.showKnown = true;
+        if (!Array.isArray(db.settings.disabledStories)) db.settings.disabledStories = [];
+        return db;
+    }
+
+    // Legacy / fallback copy in localStorage; null if absent or unparsable.
+    function parseLocalStorageDB() {
+        try {
+            const raw = localStorage.getItem(DB_KEY);
+            if (raw) {
+                const db = JSON.parse(raw);
+                if (db && db.phrases) return normalizeDB(db);
+            }
+        } catch (e) {
+            console.error('STV-Learn: failed to parse localStorage DB', e);
+        }
+        return null;
+    }
+
     /**
-     * Persist the learning DB. Returns false (after telling the user) when
-     * the write fails — typically QuotaExceededError on iOS.
+     * Synchronous read used everywhere. Before IndexedDB resolves this
+     * bootstraps from the localStorage copy (or empty); initLearnDB then
+     * swaps in the authoritative IndexedDB copy, keeping any phrases added
+     * in the gap.
+     */
+    function loadDB() {
+        if (!dbMem) dbMem = parseLocalStorageDB() || freshDB();
+        return dbMem;
+    }
+
+    /**
+     * Persist the learning DB: in-memory immediately, write-through to
+     * IndexedDB asynchronously (failures reported, then localStorage
+     * fallback — which can hit the site's localStorage quota).
      */
     function saveDB(db) {
+        dbMem = db;
+        if (!learnIdbBroken) {
+            learnIdbPut(db).catch(e => {
+                learnIdbBroken = true;
+                reportError('Lưu DB vào IndexedDB thất bại — chuyển sang localStorage', e);
+                saveDBToLocalStorage(db);
+            });
+            return true;
+        }
+        return saveDBToLocalStorage(db);
+    }
+
+    function saveDBToLocalStorage(db) {
         try {
             localStorage.setItem(DB_KEY, JSON.stringify(db));
             return true;
         } catch (e) {
             reportError('LƯU DB THẤT BẠI (thay đổi sẽ mất khi tải lại)', e);
             return false;
+        }
+    }
+
+    /**
+     * Load the authoritative DB from IndexedDB. One-time migration: an
+     * existing localStorage copy is merged in and then DELETED — that
+     * single key was ~700KB of the ~5MB iOS quota the site already fills,
+     * which is what made every localStorage DB save throw QuotaExceeded.
+     */
+    async function initLearnDB() {
+        try {
+            let stored = await learnIdbGet();
+            const legacy = parseLocalStorageDB();
+            if (!stored || !stored.phrases) {
+                stored = legacy || dbMem || freshDB();
+            } else if (legacy) {
+                stored.phrases = Object.assign({}, stored.phrases, legacy.phrases);
+                stored.settings = legacy.settings || stored.settings;
+            }
+            if (dbMem) {
+                // Changes made this session before IndexedDB resolved win.
+                stored.phrases = Object.assign({}, stored.phrases, dbMem.phrases);
+            }
+            dbMem = normalizeDB(stored);
+            await learnIdbPut(dbMem);
+            localStorage.removeItem(DB_KEY); // reclaim quota headroom
+            if (panelEl) updatePanelStats();
+        } catch (e) {
+            learnIdbBroken = true;
+            reportError('IndexedDB không dùng được — DB học dùng localStorage', e);
         }
     }
 
@@ -1083,23 +1195,37 @@
                 .filter(e => e.isSelf).length;
         }
 
-        // Total localStorage usage — quota trouble (iOS ~5MB) shows up here.
-        let usage = '—';
-        try {
-            let chars = 0;
-            for (let i = 0; i < localStorage.length; i++) {
-                const k = localStorage.key(i);
-                chars += k.length + (localStorage.getItem(k) || '').length;
-            }
-            usage = Math.round(chars * 2 / 1024) + ' KB';
-        } catch (e) { /* leave dash */ }
-
         const fmt = v => (v === null || v === undefined) ? '—' : v;
         const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
 
+        // localStorage usage, total + biggest keys — quota trouble
+        // (iOS ~5MB) and WHO is hogging it both show up here.
+        let usage = '—', topKeys = '';
+        try {
+            const sizes = [];
+            let chars = 0;
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                const n = k.length + (localStorage.getItem(k) || '').length;
+                chars += n;
+                sizes.push([k, n]);
+            }
+            usage = Math.round(chars * 2 / 1024) + ' KB';
+            sizes.sort((a, b) => b[1] - a[1]);
+            topKeys = sizes.slice(0, 4)
+                .map(([k, n]) => `${esc(k.length > 24 ? k.slice(0, 24) + '…' : k)} ${Math.round(n * 2 / 1024)}KB`)
+                .join(' · ');
+        } catch (e) { /* leave dash */ }
+
+        const dbHome = learnIdbBroken
+            ? '<b style="color:#C62828">localStorage (fallback!)</b>'
+            : 'IndexedDB ✓';
+
         el.innerHTML =
             `<b>Debug</b> · key: <code>${DBG.storyKeyAtStart || '—'}</code>` +
-            `<br>Lưu sống sót qua reload: <b>${persist}</b> · dung lượng: <b>${usage}</b>` +
+            `<br>Lưu sống sót qua reload: <b>${persist}</b> · DB học: ${dbHome}` +
+            `<br>localStorage: <b>${usage}</b>` +
+            (topKeys ? `<br>Key lớn nhất: ${topKeys}` : '') +
             `<br>$X=X lúc vào: <b>${fmt(DBG.selfCountAtStart)}</b> · sau khi ghi: <b>${fmt(DBG.selfCountAfterWrite)}</b> · bây giờ: <b>${nowCount}</b> (đã ghi ${fmt(DBG.lastWriteCount)})` +
             (DBG.syncSkipped ? `<br>Chẩn đoán chương bỏ qua: <b>${esc(DBG.syncSkipped)}</b>` : '') +
             (DBG.errors.length
@@ -2109,6 +2235,9 @@
         } catch (e) {
             reportError('Khởi tạo thất bại', e);
         }
+        // Async: load the authoritative DB from IndexedDB (and migrate the
+        // old localStorage copy out of the quota-starved localStorage).
+        initLearnDB();
 
         const start = () => {
             injectStyles();
