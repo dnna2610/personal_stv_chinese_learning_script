@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -56,11 +56,10 @@
     // Master vocabulary store, independent of the site's per-story name
     // storages. The story storage is treated as a render target: a budgeted
     // subset of phrases (present in the current chapter) is materialized
-    // into it as $X=X entries — automatically after each chapter renders
-    // (taking effect from the next chapter load, the site's native name
-    // behavior), or immediately via the "Áp dụng" button + reload. Writes
-    // only ever happen AFTER the site has read storage and rendered, so
-    // they cannot race the site's late content load on mobile.
+    // into it as $X=X entries after the chapter renders, then the chapter
+    // is re-rendered through the site's own pipeline (excute) so the set
+    // shows immediately. Writes only ever happen AFTER the site's initial
+    // render, so they cannot race the site's late content load on mobile.
     //
     // Shape:
     // {
@@ -505,75 +504,133 @@
     }
 
     /**
-     * "Áp dụng" button: pick this chapter's active set — all "known"
-     * phrases (if shown) plus up to `budget` learning phrases via SRS,
-     * restricted to phrases actually present in the chapter text — and
-     * write it to story storage. The site renders it on the next load,
-     * so the user reloads when ready. Entirely user-triggered: no race
-     * with the site's late content load on mobile.
+     * Re-render the chapter via the site's own pipeline (same function the
+     * Chạy button calls) so a just-written name set displays immediately.
      */
+    function siteReRender() {
+        try {
+            if (typeof excute === 'function') { excute(); return true; }
+        } catch (e) {
+            reportError('Re-render (excute) thất bại', e);
+        }
+        return false;
+    }
+
+    // Chapters (pathnames) already auto-re-rendered this page load — one
+    // auto re-render per chapter, so a phrase the site refuses to render
+    // as its own segment can't cause an excute() loop.
+    const autoReRendered = new Set();
+
     /**
-     * AUTO apply (v2): runs after the chapter has fully rendered and writes
-     * the presence-optimized set for the NEXT load of a chapter — the
-     * site's native "names apply on next chapter load" model. Unlike the
-     * old auto-apply there is no document-start write and no per-chapter
-     * cache, so there is nothing to race the site's late content load on
-     * mobile: by the time this runs, the site has already read storage.
+     * Core apply: choose this chapter's active set, write it to story
+     * storage, and re-render so it shows NOW (not from the next chapter —
+     * with thousands of learning phrases, the set picked for chapter N
+     * almost never overlaps chapter N+1, which made next-load semantics
+     * useless in practice).
+     *
+     * The set is built by ADOPTING the learning phrases already rendered
+     * as Chinese and topping up to the budget by SRS from phrases present
+     * in the chapter. That makes reruns fixed points: after our own
+     * re-render the adopted set equals the written set, nothing changes,
+     * no further re-render — and reloads keep the same set instead of
+     * rotating (rendered phrases would otherwise drop in SRS rank the
+     * moment they're seen).
+     *
+     * Runs auto (observer, silent, re-render once per chapter) and manual
+     * (Áp dụng button, notifications, re-render always). Returns true if
+     * a set was applied.
      */
-    function autoApplyChapter() {
-        if (!dbReady) return; // never write from the empty bootstrap DB
-        const db = loadDB();
-        if (!db.settings.autoApply) return;
+    function applyChapterSet(manual) {
+        if (!dbReady) {
+            if (manual) showNotification('DB học đang tải — đợi 1–2 giây rồi bấm lại', 'error');
+            return false;
+        }
         const storyKey = getLocalStorageKeyFromURL();
-        if (!storyKey || db.settings.disabledStories.includes(storyKey)) return;
+        if (!storyKey) {
+            if (manual) showNotification('Không xác định được key truyện từ URL', 'error');
+            return false;
+        }
+        const db = loadDB();
+        if (db.settings.disabledStories.includes(storyKey)) {
+            if (manual) showNotification('Truyện này đang tắt học — bật lại trong bảng Học rồi thử lại', 'error');
+            return false;
+        }
         const text = reconstructChapterText();
-        if (!text) return;
+        if (!text) {
+            if (manual) showNotification('Chưa thấy nội dung chương — đợi trang tải xong rồi bấm lại', 'error');
+            return false;
+        }
 
         const sel = selectActiveForChapter(db, text);
-        writeActiveToStorage(storyKey, sel.active);
-        DBG.lastWriteCount = sel.active.length;
+
+        // Adopt the learning phrases the site is already rendering.
+        const renderedNow = [];
+        const seenT = new Set();
+        document.querySelectorAll('.contentbox i[t]').forEach(el => {
+            const t = (el.getAttribute('t') || '').trim();
+            if (!t || seenT.has(t) || el.textContent.trim() !== t) return;
+            const info = db.phrases[t];
+            if (info && info.status !== 'known' && isMaterializable(t)) {
+                seenT.add(t);
+                renderedNow.push(t);
+            }
+        });
+
+        // If the rendered set exceeds the budget (e.g. a just-added manual
+        // phrase on top of a full set), trim non-manual phrases first.
+        renderedNow.sort((a, b) =>
+            (db.phrases[b].manual ? 1 : 0) - (db.phrases[a].manual ? 1 : 0));
+
+        const budget = db.settings.budget;
+        const learning = renderedNow.slice(0, budget);
+        const have = new Set(learning);
+        for (const p of sel.learningList) {
+            if (learning.length >= budget) break;
+            if (!have.has(p)) { have.add(p); learning.push(p); }
+        }
+        const active = [...(db.settings.showKnown ? sel.knownList : []), ...learning];
+
+        writeActiveToStorage(storyKey, active);
+        DBG.lastWriteCount = active.length;
         DBG.selfCountAfterWrite = parseStorageEntries(localStorage.getItem(storyKey))
             .filter(e => e.isSelf).length;
+
+        // Re-render only when the written set differs from what's shown.
+        const changed = renderedNow.length > budget ||
+            learning.some(p => !seenT.has(p));
+        const path = window.location.pathname;
+        let reRendered = false;
+        if (changed && (manual || !autoReRendered.has(path))) {
+            autoReRendered.add(path);
+            // Count exposures against the final render, not the pre-apply one.
+            sessionStorage.removeItem('stv-exposed:' + path);
+            reRendered = siteReRender();
+        }
+
+        updateChapterDiagnostics();
+        updatePanelStats();
+
+        if (manual) {
+            const knownNote = (db.settings.showKnown && sel.knownPresent)
+                ? ` + ${sel.knownPresent} đã thuộc` : '';
+            showNotification(
+                `Đã áp dụng ${learning.length}/${sel.learningPresent} cụm đang học${knownNote}` +
+                (reRendered || !changed ? ' — đang hiển thị' : ' — tải lại trang (F5) để hiển thị'),
+                'success'
+            );
+        }
+        return true;
+    }
+
+    function autoApplyChapter() {
+        const db = dbReady ? loadDB() : null;
+        if (!db || !db.settings.autoApply) return;
+        applyChapterSet(false);
     }
 
     function applyBudgetNow() {
         try {
-            if (!dbReady) {
-                showNotification('DB học đang tải — đợi 1–2 giây rồi bấm lại', 'error');
-                return;
-            }
-            const storyKey = getLocalStorageKeyFromURL();
-            if (!storyKey) {
-                showNotification('Không xác định được key truyện từ URL', 'error');
-                return;
-            }
-            const db = loadDB();
-            if (db.settings.disabledStories.includes(storyKey)) {
-                showNotification('Truyện này đang tắt học — bật lại trong bảng Học rồi thử lại', 'error');
-                return;
-            }
-            const text = reconstructChapterText();
-            if (!text) {
-                showNotification('Chưa thấy nội dung chương — đợi trang tải xong rồi bấm lại', 'error');
-                return;
-            }
-
-            const sel = selectActiveForChapter(db, text);
-            writeActiveToStorage(storyKey, sel.active);
-            DBG.lastWriteCount = sel.active.length;
-            // Read straight back: did the write land?
-            DBG.selfCountAfterWrite = parseStorageEntries(localStorage.getItem(storyKey))
-                .filter(e => e.isSelf).length;
-
-            updateChapterDiagnostics();
-            updatePanelStats();
-
-            const knownNote = (db.settings.showKnown && sel.knownPresent)
-                ? ` + ${sel.knownPresent} đã thuộc` : '';
-            showNotification(
-                `Đã áp dụng ${sel.learningActive}/${sel.learningPresent} cụm đang học${knownNote} cho chương này — tải lại trang (F5) để hiển thị`,
-                'success'
-            );
+            applyChapterSet(true);
         } catch (e) {
             reportError('Áp dụng thất bại', e);
         }
@@ -829,7 +886,7 @@
 
         if (action === 'promote') {
             info.status = 'known';
-            showNotification(`"${phrase}" → đã thuộc. Slot trống cho từ mới từ chương kế!`, 'success');
+            showNotification(`"${phrase}" → đã thuộc. Slot trống cho từ mới — bấm Áp dụng để đổi ngay!`, 'success');
         } else if (action === 'demote') {
             info.status = 'learning';
             showNotification(`"${phrase}" → học lại`, 'info');
@@ -1105,7 +1162,7 @@
             </label>
             <label class="stv-panel-row">
                 <input type="checkbox" id="stv-auto-toggle" ${db.settings.autoApply ? 'checked' : ''}>
-                Tự động áp dụng (hiệu lực từ chương kế)
+                Tự động áp dụng (hiện ngay trong chương)
             </label>
             <div class="stv-panel-row stv-panel-buttons">
                 <button id="stv-apply-btn" title="Chọn cụm theo budget cho chương này và lưu vào kho — tải lại trang để hiển thị">Áp dụng</button>
@@ -1117,7 +1174,7 @@
             </div>
             <div class="stv-panel-row" id="stv-chapter-overview"></div>
             <div class="stv-panel-row" id="stv-debug-row"></div>
-            <div class="stv-panel-hint">Tự động: cụm được chọn sau khi đọc, hiệu lực từ chương kế. Bấm <b>Áp dụng</b> + tải lại trang để áp cho chương này ngay. Mệt thì kéo slider xuống.</div>
+            <div class="stv-panel-hint">Tự động: cụm được chọn và hiển thị ngay sau khi chương tải xong (~2 giây). Bấm <b>Áp dụng</b> để ép chọn lại. Mệt thì kéo slider xuống.</div>
         `;
         document.body.appendChild(panelEl);
 
@@ -1129,7 +1186,7 @@
             const db2 = loadDB();
             db2.settings.budget = parseInt(slider.value, 10);
             saveDB(db2);
-            showNotification(`Budget: ${slider.value} cụm — hiệu lực từ chương kế (hoặc bấm Áp dụng)`, 'info');
+            showNotification(`Budget: ${slider.value} cụm — bấm Áp dụng để áp ngay`, 'info');
             updatePanelStats();
         });
 
@@ -1140,14 +1197,18 @@
             const result = learnAddPhrase(value);
             if (result === 'error') return; // saveDB already told the user
             manualInput.value = '';
-            // Materialize the explicit add into this story right away so
-            // it shows after a reload without an Áp dụng pass.
-            if (result === 'added' && isMaterializable(value)) appendSelfEntryToStory(value);
+            // Materialize the explicit add into this story right away and
+            // re-render so it shows immediately.
+            let shownNow = false;
+            if (result === 'added' && isMaterializable(value)) {
+                appendSelfEntryToStory(value);
+                shownNow = siteReRender();
+            }
             updatePanelStats();
             refreshNewHighlight();
             const singleNote = !isMaterializable(value) ? ' (1 ký tự: chỉ Anki + nhận diện)' : '';
             showNotification(result === 'added'
-                ? `Đã thêm "${value}"${singleNote} — tải lại trang để hiện trong chương này`
+                ? `Đã thêm "${value}"${singleNote}${shownNow ? ' — đang hiển thị' : ' — tải lại trang để hiển thị'}`
                 : `"${value}" đã có trong kho`, result === 'added' ? 'success' : 'info');
         };
         panelEl.querySelector('#stv-manual-btn').addEventListener('click', submitManual);
@@ -1160,8 +1221,8 @@
             db2.settings.showKnown = e.target.checked;
             saveDB(db2);
             showNotification(e.target.checked
-                ? 'Cụm đã thuộc sẽ hiển thị (từ chương kế, hoặc bấm Áp dụng)'
-                : 'Ẩn cụm đã thuộc — slider 0 = tắt hẳn (từ chương kế, hoặc bấm Áp dụng)', 'info');
+                ? 'Cụm đã thuộc sẽ hiển thị — bấm Áp dụng để áp ngay'
+                : 'Ẩn cụm đã thuộc (slider 0 = tắt hẳn) — bấm Áp dụng để áp ngay', 'info');
             updatePanelStats();
         });
 
@@ -1194,7 +1255,7 @@
             db2.settings.autoApply = e.target.checked;
             saveDB(db2);
             showNotification(e.target.checked
-                ? 'Tự động áp dụng BẬT — cụm được chọn sau mỗi chương, hiệu lực từ chương kế'
+                ? 'Tự động áp dụng BẬT — cụm được chọn và hiển thị ngay sau khi chương tải xong'
                 : 'Tự động áp dụng TẮT — dùng nút Áp dụng', 'info');
         });
 
@@ -2022,7 +2083,7 @@
             showNotification(`Tìm thấy ${added} cụm mới nhưng LƯU THẤT BẠI — xem Debug trong bảng Học`, 'error');
             return;
         }
-        showNotification(`Đã thêm ${added} cụm mới vào DB học — hiệu lực từ chương kế (hoặc bấm Áp dụng)`, 'success');
+        showNotification(`Đã thêm ${added} cụm mới vào DB học — sẽ hiển thị dần theo budget`, 'success');
 
         // Harvest hv/meaning for the new phrases from this chapter's
         // <i h= v=> attributes right away.
@@ -2094,10 +2155,11 @@
         });
         localStorage.setItem(storageKey, allEntries.join('~//~') + '~//~');
 
+        const shownNow = siteReRender();
         const singleNote = !isMaterializable(chineseText)
             ? ' (1 ký tự: chỉ truyện này + Anki, không tự lan)'
             : '';
-        showNotification(`Added "${chineseText}"${isNew ? ' (+learn DB)' : ''}${singleNote} — tải lại trang để hiển thị!`, 'success');
+        showNotification(`Added "${chineseText}"${isNew ? ' (+learn DB)' : ''}${singleNote}${shownNow ? ' — đang hiển thị!' : ' — tải lại trang để hiển thị!'}`, 'success');
     }
 
     /**
