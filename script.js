@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.6
+// @version      2.7
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -523,10 +523,16 @@
         return false;
     }
 
-    // Chapters (pathnames) already auto-re-rendered this page load — one
-    // auto re-render per chapter, so a phrase the site refuses to render
-    // as its own segment can't cause an excute() loop.
-    const autoReRendered = new Set();
+    // Auto re-render budget per chapter (pathname) per page load. One was
+    // not enough: on mobile the first attempt fires while the site is
+    // still streaming/translating content, and the site's own pipeline
+    // then overwrites it — later content batches re-trigger the pass, so
+    // each gets another chance. The fixed-point set construction stops
+    // the retries as soon as the rendered set matches the written one,
+    // and the cap stops phrases the site never renders as their own
+    // segment from looping excute().
+    const AUTO_RERENDER_MAX = 3;
+    const autoRenderCounts = {};
 
     /**
      * Core apply: choose this chapter's active set, write it to story
@@ -607,8 +613,9 @@
             learning.some(p => !seenT.has(p));
         const path = window.location.pathname;
         let reRendered = false;
-        if (changed && (manual || !autoReRendered.has(path))) {
-            autoReRendered.add(path);
+        const tries = autoRenderCounts[path] || 0;
+        if (changed && (manual || tries < AUTO_RERENDER_MAX)) {
+            if (!manual) autoRenderCounts[path] = tries + 1;
             // Count exposures against the final render, not the pre-apply one.
             sessionStorage.removeItem('stv-exposed:' + path);
             reRendered = siteReRender();
