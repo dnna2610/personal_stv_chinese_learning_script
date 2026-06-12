@@ -16,6 +16,26 @@
     'use strict';
 
     // =====================================================================
+    // iOS storage diagnostics (captured at script start, before anything
+    // touches storage). Two independent probes:
+    //   1. PERSIST PROBE — a counter on a key the SITE never touches. If it
+    //      increments across reloads, our localStorage writes survive at all
+    //      (not sandboxed by Stay). If it stays 0/blank, our writes never
+    //      reach the page's storage → storage approach is impossible.
+    //   2. CLOBBER PROBE — the count of $X=X entries the story key held when
+    //      we arrived this load, i.e. what the SITE preserved from our last
+    //      write. If our last-write count > this, the site clobbered us.
+    // =====================================================================
+    const DBG = { persistPrev: null, persistOK: null, storyKeyAtStart: null, selfCountAtStart: null, selfCountAfterWrite: null, lastWriteCount: null };
+    try {
+        const raw = localStorage.getItem('STV_PERSIST_PROBE');
+        DBG.persistPrev = raw === null ? null : parseInt(raw, 10);
+        DBG.persistOK = (raw !== null && !isNaN(DBG.persistPrev));
+        const next = (DBG.persistOK ? DBG.persistPrev : 0) + 1;
+        localStorage.setItem('STV_PERSIST_PROBE', String(next));
+    } catch (e) { /* storage unavailable */ }
+
+    // =====================================================================
     // Learning DB
     //
     // Master vocabulary store, independent of the site's per-story name
@@ -243,22 +263,14 @@
     //
     // We write the chapter's active $X=X set to story storage; the SITE
     // renders the keeps when it reads storage on load. We never rewrite the
-    // chapter text ourselves — we only READ the DOM afterwards to report
-    // how many keeps actually applied.
-    //
-    // Timing: on desktop our document-start write wins the race → same-load.
-    // On iOS Safari + a userscript manager (Stay) the script may run after
-    // the page's storage read, so the write applies on the NEXT load (a
-    // reload) — the same as the site's native "names apply next chapter"
-    // behavior. The panel's "đang hiện" count makes this visible: if it
-    // stays 0 even after a reload, the site isn't reading our storage on
-    // that device and DOM rendering would be the only fallback.
+    // chapter text ourselves — we only READ the DOM afterwards to report how
+    // many keeps actually applied ("đang hiện" in the panel).
     // =====================================================================
 
     // Panel diagnostics for the current chapter.
     let chapterLearningActive = null;   // learning phrases that fit the budget
     let chapterLearningPresent = null;  // learning phrases present in the text
-    let chapterRenderedLearning = null; // learning phrases actually shown (DOM)
+    let chapterRenderedLearning = null; // learning phrases actually shown (DOM read)
 
     // Per-chapter cache of the presence-optimized active set, so the next
     // document-start can write it before the site reads (same-load on desktop).
@@ -313,6 +325,13 @@
     function applyBudgetToStoryStorage() {
         const storyKey = getLocalStorageKeyFromURL();
         if (!storyKey) return;
+
+        // CLOBBER PROBE: how many $X=X did the story key hold when we arrived,
+        // i.e. what the site preserved from our previous write?
+        DBG.storyKeyAtStart = storyKey;
+        DBG.selfCountAtStart = parseStorageEntries(localStorage.getItem(storyKey))
+            .filter(e => e.isSelf).length;
+
         const db = loadDB();
         if (!db.settings.autoApply || db.settings.disabledStories.includes(storyKey)) return;
         if (importFromNameStorages(db)) saveDB(db);
@@ -329,6 +348,11 @@
             activeList = [...(db.settings.showKnown ? known : []), ...learningActive];
         }
         writeActiveToStorage(storyKey, activeList);
+        DBG.lastWriteCount = activeList.length;
+
+        // Read straight back: did our write even land in this storage?
+        DBG.selfCountAfterWrite = parseStorageEntries(localStorage.getItem(storyKey))
+            .filter(e => e.isSelf).length;
     }
 
     let reloadHintShown = false;
@@ -875,6 +899,7 @@
                 <button id="stv-dict-btn" style="display:none;">Tải từ điển (~25MB)</button>
             </div>
             <div class="stv-panel-row" id="stv-chapter-overview"></div>
+            <div class="stv-panel-row" id="stv-debug-row"></div>
             <div class="stv-panel-hint">Thay đổi có hiệu lực từ chương kế (như cơ chế name của site). Mệt thì kéo slider xuống.</div>
         `;
         document.body.appendChild(panelEl);
@@ -980,6 +1005,7 @@
 
         updatePanelStats();
         updateChapterOverview();
+        updateDebugRow();
         return panelEl;
     }
 
@@ -1002,6 +1028,33 @@
             btn.disabled = false;
             btn.textContent = 'Tải từ điển (~25MB)';
         }
+    }
+
+    /**
+     * Storage diagnostics readout. Lets the user (who can't open a console
+     * on iOS) see whether localStorage writes survive and whether the site
+     * clobbers our story-key write.
+     */
+    function updateDebugRow() {
+        if (!panelEl) return;
+        const el = panelEl.querySelector('#stv-debug-row');
+        if (!el) return;
+
+        const persist = DBG.persistOK
+            ? `OK (lần ${DBG.persistPrev})`
+            : (DBG.persistPrev === null ? 'CHƯA (lần đầu)' : 'LỖI');
+
+        // Current $X=X count in story storage right now (post-site-activity).
+        let nowCount = '—';
+        if (DBG.storyKeyAtStart) {
+            nowCount = parseStorageEntries(localStorage.getItem(DBG.storyKeyAtStart))
+                .filter(e => e.isSelf).length;
+        }
+
+        el.innerHTML =
+            `<b>Debug</b> · key: <code>${DBG.storyKeyAtStart || '—'}</code>` +
+            `<br>Lưu sống sót qua reload: <b>${persist}</b>` +
+            `<br>$X=X lúc vào: <b>${DBG.selfCountAtStart}</b> · sau khi ghi: <b>${DBG.selfCountAfterWrite}</b> · bây giờ: <b>${nowCount}</b> (đã ghi ${DBG.lastWriteCount})`;
     }
 
     /**
@@ -1045,6 +1098,7 @@
 
     function updatePanelStats(annotatedCount) {
         if (!panelEl) return;
+        updateDebugRow();
         const db = loadDB();
         const { known, learningTotal, singles } = selectActivePhrases(db);
 
@@ -1062,11 +1116,9 @@
 
         const statsEl = panelEl.querySelector('#stv-panel-stats');
         if (statsEl) {
-            // "Chương này": learning phrases present in this chapter and how
-            // many fit the budget (more honest than the global budget count).
             // "X/Y đang học có mặt (đang hiện Z)": X fit the budget, Y are
             // present in the chapter, Z are actually rendered as Chinese now.
-            // Z < X means the site hasn't applied our storage yet → reload.
+            // Z < X means the site hasn't applied our storage yet.
             const chapterInfo = (chapterLearningPresent !== null)
                 ? ` · Chương này: <b>${chapterLearningActive}</b>/${chapterLearningPresent} đang học có mặt` +
                   (chapterRenderedLearning !== null ? ` (đang hiện ${chapterRenderedLearning})` : '')
@@ -1214,6 +1266,11 @@
             }
             #stv-learn-panel #stv-manual-btn:hover { background: #00695C; }
             #stv-learn-panel #stv-dict-row { font-size: 12px; color: #555; }
+            #stv-learn-panel #stv-debug-row {
+                font-size: 11px; color: #555; background: #F0F0F0;
+                border-radius: 4px; padding: 6px; line-height: 1.5;
+            }
+            #stv-learn-panel #stv-debug-row code { font-size: 11px; word-break: break-all; }
             #stv-learn-panel #stv-dict-btn {
                 margin-left: 8px; background: #5C6BC0; color: #fff; border: none;
                 border-radius: 4px; padding: 5px 10px; cursor: pointer; font-size: 12px;
