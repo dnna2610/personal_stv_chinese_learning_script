@@ -373,18 +373,40 @@
         const text = reconstructChapterText();
         if (!text) return;
 
-        const { active, learningActive, learningPresent } = selectActiveForChapter(db, text);
-        writeActiveToStorage(storyKey, active);
+        // Present phrases (for the count) and a fresh SRS pick (first visit).
+        const sel = selectActiveForChapter(db, text);
+
+        // STABLE per-chapter set: reuse the set chosen for this exact chapter
+        // instead of recomputing — otherwise seeing phrases demotes them in
+        // SRS and the "active" set churns every load (never matching what's
+        // rendered). Only recompute on first visit or when settings change.
         const cache = loadActiveCache();
+        const cached = cache[window.location.pathname];
+        let active;
+        if (cached &&
+            cached.budget === db.settings.budget &&
+            cached.showKnown === db.settings.showKnown) {
+            // Keep only entries still present + still in the DB as wanted.
+            active = cached.active.filter(p =>
+                text.includes(p) && isMaterializable(p) && db.phrases[p] &&
+                (db.phrases[p].status !== 'known' || db.settings.showKnown)
+            );
+        } else {
+            active = sel.active;
+        }
         cache[window.location.pathname] = {
             active,
             budget: db.settings.budget,
             showKnown: db.settings.showKnown
         };
         saveActiveCache(cache);
+        writeActiveToStorage(storyKey, active);
 
-        // READ-ONLY: distinct active learning phrases shown as Chinese now.
+        // READ-ONLY: of the CHOSEN set, how many learning phrases are shown
+        // as Chinese right now?
         const activeSet = new Set(active);
+        const learningActive = active.filter(p =>
+            db.phrases[p] && db.phrases[p].status !== 'known').length;
         const rendered = new Set();
         document.querySelectorAll('.contentbox i[t]').forEach(el => {
             const t = (el.getAttribute('t') || '').trim();
@@ -395,7 +417,7 @@
         });
 
         chapterLearningActive = learningActive;
-        chapterLearningPresent = learningPresent;
+        chapterLearningPresent = sel.learningPresent;
         chapterRenderedLearning = rendered.size;
         if (panelEl) updatePanelStats(Object.keys(lastChapterCounts).length);
 
