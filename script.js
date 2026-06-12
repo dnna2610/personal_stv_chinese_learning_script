@@ -402,8 +402,8 @@
         saveActiveCache(cache);
         writeActiveToStorage(storyKey, active);
 
-        // READ-ONLY: of the CHOSEN set, how many learning phrases are shown
-        // as Chinese right now?
+        // READ-ONLY: of the chosen set, how many learning phrases did the
+        // site render as Chinese this load?
         const activeSet = new Set(active);
         const learningActive = active.filter(p =>
             db.phrases[p] && db.phrases[p].status !== 'known').length;
@@ -421,6 +421,8 @@
         chapterRenderedLearning = rendered.size;
         if (panelEl) updatePanelStats(Object.keys(lastChapterCounts).length);
 
+        // First visit to a chapter writes the stable set but the site read
+        // the previous storage value — a reload makes it read our set.
         if (rendered.size < learningActive && !reloadHintShown) {
             reloadHintShown = true;
             showNotification(
@@ -493,8 +495,10 @@
         const schedule = () => {
             clearTimeout(timer);
             timer = setTimeout(() => {
-                annotateRenderedPhrases();
+                // Render keeps (storage + DOM safety-net) first, then count /
+                // harvest the now-fully-applied chapter.
                 syncChapterKeeps();
+                annotateRenderedPhrases();
             }, 1500);
         };
         const observer = new MutationObserver(mutations => {
@@ -1139,8 +1143,8 @@
         const statsEl = panelEl.querySelector('#stv-panel-stats');
         if (statsEl) {
             // "X/Y đang học có mặt (đang hiện Z)": X fit the budget, Y are
-            // present in the chapter, Z are actually rendered as Chinese now.
-            // Z < X means the site hasn't applied our storage yet.
+            // present in the chapter, Z are rendered as Chinese right now.
+            // Z < X on a first visit → reload to apply the stored set.
             const chapterInfo = (chapterLearningPresent !== null)
                 ? ` · Chương này: <b>${chapterLearningActive}</b>/${chapterLearningPresent} đang học có mặt` +
                   (chapterRenderedLearning !== null ? ` (đang hiện ${chapterRenderedLearning})` : '')
