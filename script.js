@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.8
+// @version      2.11
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -387,16 +387,33 @@
     }
 
     /**
+     * Lefts of real translation names ($X=Y, X≠Y) in this story's storage.
+     * Learn mode must never touch these: a phrase the user named keeps
+     * rendering as their chosen Vietnamese name, never as kept Chinese,
+     * and must not occupy a learning budget slot.
+     */
+    function storyNameSet(storyKey) {
+        const set = new Set();
+        if (!storyKey) return set;
+        parseStorageEntries(localStorage.getItem(storyKey)).forEach(e => {
+            if (!e.isSelf && e.left) set.add(e.left);
+        });
+        return set;
+    }
+
+    /**
      * Like selectActivePhrases, but restricted to phrases that actually
      * appear in this chapter's text — so budget slots aren't wasted on
-     * phrases absent from the chapter. Returns the full active list
-     * (known + budgeted learning) plus diagnostics.
+     * phrases absent from the chapter — and excluding phrases that are
+     * names in this story (see storyNameSet). Returns the full active
+     * list (known + budgeted learning) plus diagnostics.
      */
-    function selectActiveForChapter(db, text) {
+    function selectActiveForChapter(db, text, nameSet) {
         const known = [];
         const learning = [];
         Object.entries(db.phrases).forEach(([phrase, info]) => {
             if (!isMaterializable(phrase)) return;
+            if (nameSet && nameSet.has(phrase)) return; // named → Vietnamese
             if (!text.includes(phrase)) return; // present in this chapter only
             if (info.status === 'known') known.push(phrase);
             else learning.push(phrase);
@@ -562,7 +579,8 @@
             return false;
         }
 
-        const sel = selectActiveForChapter(db, text);
+        const nameSet = storyNameSet(storyKey);
+        const sel = selectActiveForChapter(db, text, nameSet);
 
         // Adopt the learning phrases the site is already rendering.
         const renderedNow = [];
@@ -570,6 +588,7 @@
         document.querySelectorAll('.contentbox i[t]').forEach(el => {
             const t = (el.getAttribute('t') || '').trim();
             if (!t || seenT.has(t) || el.textContent.trim() !== t) return;
+            if (nameSet.has(t)) return; // named → stays Vietnamese
             const info = db.phrases[t];
             if (info && info.status !== 'known' && isMaterializable(t)) {
                 seenT.add(t);
@@ -654,7 +673,7 @@
         const text = reconstructChapterText();
         if (!text) { DBG.syncSkipped = 'chưa thấy nội dung chương'; return; }
 
-        const sel = selectActiveForChapter(db, text);
+        const sel = selectActiveForChapter(db, text, storyNameSet(storyKey));
 
         const storedSelf = new Set(parseStorageEntries(localStorage.getItem(storyKey))
             .filter(e => e.isSelf).map(e => e.left));
@@ -858,12 +877,28 @@
         if (tooltipPhrase !== phrase) return; // moved on
         el = slot();
         if (!el) return;
+        el.textContent = '';
         if (!m) {
-            el.textContent = '—';
-            el.classList.remove('stv-perchar');
+            // No exact match (and not an A-not-A) — show a quiet note
+            // rather than a misleading per-character breakdown.
+            const note = document.createElement('span');
+            note.className = 'stv-tip-nomatch';
+            note.textContent = 'Không có nghĩa khớp cả cụm';
+            el.appendChild(note);
+        } else if (m.kind === 'anota') {
+            // Show the base word's meaning, labelled so the reader knows
+            // which word the "có … không" question is about.
+            const base = document.createElement('span');
+            base.className = 'stv-tip-base';
+            base.textContent = m.base;
+            el.appendChild(base);
+            el.appendChild(document.createTextNode(' ' + m.text));
+            const note = document.createElement('div');
+            note.className = 'stv-tip-note';
+            note.textContent = 'dạng hỏi “có … không”';
+            el.appendChild(note);
         } else {
             el.textContent = m.text;
-            el.classList.toggle('stv-perchar', m.perChar);
         }
     }
 
@@ -1066,15 +1101,34 @@
         return true;
     }
 
-    // First gloss sense, for compact per-character display.
-    function firstSense(gloss) {
-        return (gloss || '').split(/;\s*/)[0].trim();
+    /**
+     * Detect a Chinese A-not-A question and return the base word being
+     * asked about, or null. The verb/adjective is repeated around the
+     * negator (不 or 没):
+     *   开不开心 → 开心   好不好 → 好   是不是 → 是
+     *   有没有 → 有       喜不喜欢 → 喜欢   喜欢不喜欢 → 喜欢
+     * This construction is everywhere in dialogue, and a per-character
+     * reading of it ("开 to open · 不 not · 开心 happy") is nonsense.
+     */
+    function aNotABase(phrase) {
+        const chars = [...phrase];
+        if (chars.length < 3) return null;
+        const negIdx = chars.findIndex(c => c === '不' || c === '没');
+        // Negator must sit between two parts (not first/last char).
+        if (negIdx <= 0 || negIdx === chars.length - 1) return null;
+        const before = chars.slice(0, negIdx).join('');
+        const after = chars.slice(negIdx + 1).join('');
+        // The part after the negator must restate the part before it.
+        return after.startsWith(before) ? after : null;
     }
 
     /**
-     * Look up a phrase's meaning from CC-CEDICT. Returns
-     * { text, perChar } or null. For phrases not in the dictionary,
-     * falls back to per-character glosses.
+     * Look up a phrase's meaning from CC-CEDICT. Returns { text, kind }
+     * or null. kind is 'exact' (whole phrase is a dictionary entry) or
+     * 'anota' (an A-not-A question resolved to its base word, `base`).
+     * Anything else returns null: the old per-character fallback produced
+     * misleading glosses, so a partial phrase shows no meaning rather than
+     * a wrong one.
      */
     async function lookupMeaning(phrase) {
         if (meaningCache.has(phrase)) return meaningCache.get(phrase);
@@ -1083,14 +1137,13 @@
         let out = null;
         const direct = await dictGet(phrase);
         if (direct) {
-            out = { text: direct, perChar: false };
-        } else if ([...phrase].length > 1) {
-            const parts = [];
-            for (const ch of phrase) {
-                const g = await dictGet(ch);
-                if (g) parts.push(`${ch} ${firstSense(g)}`);
+            out = { text: direct, kind: 'exact' };
+        } else {
+            const base = aNotABase(phrase);
+            if (base) {
+                const g = await dictGet(base);
+                if (g) out = { text: g, kind: 'anota', base };
             }
-            if (parts.length) out = { text: parts.join(' · '), perChar: true };
         }
         meaningCache.set(phrase, out);
         return out;
@@ -1202,9 +1255,11 @@
             if (result === 'error') return; // saveDB already told the user
             manualInput.value = '';
             // Materialize the explicit add into this story right away and
-            // re-render so it shows immediately.
+            // re-render so it shows immediately — unless the phrase is a
+            // name here: the Vietnamese name stays.
+            const isName = storyNameSet(getLocalStorageKeyFromURL()).has(value);
             let shownNow = false;
-            if (result === 'added' && isMaterializable(value)) {
+            if (result === 'added' && isMaterializable(value) && !isName) {
                 appendSelfEntryToStory(value);
                 shownNow = siteReRender();
             }
@@ -1212,7 +1267,9 @@
             refreshNewHighlight();
             const singleNote = !isMaterializable(value) ? ' (1 ký tự: chỉ Anki + nhận diện)' : '';
             showNotification(result === 'added'
-                ? `Đã thêm "${value}"${singleNote}${shownNow ? ' — nếu chưa hiện, tải lại trang (F5)' : ' — tải lại trang để hiển thị'}`
+                ? (isName
+                    ? `Đã thêm "${value}" vào DB — nhưng đang là name tiếng Việt trong truyện này nên giữ nguyên`
+                    : `Đã thêm "${value}"${singleNote}${shownNow ? ' — nếu chưa hiện, tải lại trang (F5)' : ' — tải lại trang để hiển thị'}`)
                 : `"${value}" đã có trong kho`, result === 'added' ? 'success' : 'info');
         };
         panelEl.querySelector('#stv-manual-btn').addEventListener('click', submitManual);
@@ -1494,7 +1551,9 @@
             #stv-learn-tooltip .stv-tip-pinyin { color: #80CBC4; font-size: 15px; }
             #stv-learn-tooltip .stv-tip-hv { color: #FFCC80; font-size: 13px; }
             #stv-learn-tooltip .stv-tip-meaning { color: #ECEFF1; font-size: 13px; }
-            #stv-learn-tooltip .stv-tip-meaning.stv-perchar { color: #B0BEC5; font-style: italic; }
+            #stv-learn-tooltip .stv-tip-base { color: #80CBC4; font-weight: bold; }
+            #stv-learn-tooltip .stv-tip-note { color: #90A4AE; font-size: 11px; font-style: italic; margin-top: 2px; }
+            #stv-learn-tooltip .stv-tip-nomatch { color: #90A4AE; font-size: 12px; font-style: italic; }
             #stv-learn-tooltip .stv-tip-nodict { color: #90A4AE; font-size: 12px; }
             #stv-learn-tooltip .stv-tip-meta { color: #B0BEC5; font-size: 12px; }
             #stv-learn-tooltip .stv-tip-suggest { color: #FFD54F; font-size: 12px; margin-top: 2px; }
