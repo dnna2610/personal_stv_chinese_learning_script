@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.11
+// @version      2.12
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -103,34 +103,70 @@
     function openLearnIdb() {
         if (learnIdbPromise) return learnIdbPromise;
         learnIdbPromise = new Promise((resolve, reject) => {
-            const req = indexedDB.open(LEARN_IDB, 1);
+            let req;
+            try {
+                req = indexedDB.open(LEARN_IDB, 1);
+            } catch (e) { learnIdbPromise = null; reject(e); return; }
             req.onupgradeneeded = () => {
                 const idb = req.result;
                 if (!idb.objectStoreNames.contains(LEARN_STORE)) {
                     idb.createObjectStore(LEARN_STORE);
                 }
             };
-            req.onsuccess = () => resolve(req.result);
-            req.onerror = () => reject(req.error);
+            req.onsuccess = () => {
+                const idb = req.result;
+                // iOS Safari can close the connection out from under us
+                // (backgrounding, versionchange). Drop the cached handle so
+                // the next call re-opens a fresh one instead of throwing
+                // "The database is closing".
+                idb.onclose = () => { learnIdbPromise = null; };
+                idb.onversionchange = () => {
+                    try { idb.close(); } catch (e) { /* ignore */ }
+                    learnIdbPromise = null;
+                };
+                resolve(idb);
+            };
+            req.onerror = () => { learnIdbPromise = null; reject(req.error); };
         });
         return learnIdbPromise;
     }
 
+    /**
+     * Run fn(idb)->Promise against the learning IndexedDB, retrying once on
+     * InvalidStateError — a cached connection in a "closing" state (common
+     * on iOS) throws that when starting a transaction; a fresh connection
+     * fixes it.
+     */
+    function withLearnIdb(fn) {
+        return openLearnIdb().then(fn).catch(e => {
+            // InvalidStateError = transaction on a closing connection;
+            // AbortError = in-flight transaction aborted as it closed.
+            // Both mean the cached handle is stale — re-open and retry once.
+            if (e && (e.name === 'InvalidStateError' || e.name === 'AbortError')) {
+                learnIdbPromise = null;
+                return openLearnIdb().then(fn);
+            }
+            throw e;
+        });
+    }
+
     function learnIdbGet() {
-        return openLearnIdb().then(idb => new Promise((resolve, reject) => {
+        return withLearnIdb(idb => new Promise((resolve, reject) => {
             const tx = idb.transaction(LEARN_STORE, 'readonly');
             const req = tx.objectStore(LEARN_STORE).get('db');
             req.onsuccess = () => resolve(req.result || null);
             req.onerror = () => reject(req.error);
+            tx.onabort = () => reject(tx.error || new Error('tx aborted'));
         }));
     }
 
     function learnIdbPut(db) {
-        return openLearnIdb().then(idb => new Promise((resolve, reject) => {
+        return withLearnIdb(idb => new Promise((resolve, reject) => {
             const tx = idb.transaction(LEARN_STORE, 'readwrite');
             tx.objectStore(LEARN_STORE).put(db, 'db');
             tx.oncomplete = resolve;
             tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error || new Error('tx aborted'));
         }));
     }
 
@@ -185,20 +221,20 @@
 
     /**
      * Persist the learning DB: in-memory immediately, write-through to
-     * IndexedDB asynchronously (failures reported, then localStorage
-     * fallback — which can hit the site's localStorage quota).
+     * IndexedDB asynchronously. learnIdbPut already retries a fresh
+     * connection on the iOS "database is closing" error; if it still
+     * fails we keep the change in memory and retry on the next save rather
+     * than falling back to the (full) localStorage — that fallback only
+     * threw QuotaExceeded and lost the data. localStorage is used only
+     * when IndexedDB is genuinely unavailable (set during init).
      */
     function saveDB(db) {
         dbMem = db;
-        if (!learnIdbBroken) {
-            learnIdbPut(db).catch(e => {
-                learnIdbBroken = true;
-                reportError('Lưu DB vào IndexedDB thất bại — chuyển sang localStorage', e);
-                saveDBToLocalStorage(db);
-            });
-            return true;
-        }
-        return saveDBToLocalStorage(db);
+        if (learnIdbBroken) return saveDBToLocalStorage(db);
+        learnIdbPut(db).catch(e => {
+            reportError('Lưu DB vào IndexedDB thất bại — giữ trong bộ nhớ, sẽ thử lại lần lưu sau', e);
+        });
+        return true;
     }
 
     function saveDBToLocalStorage(db) {
@@ -2227,7 +2263,13 @@
             if (aMatch && bMatch) return aMatch[1].length - bMatch[1].length;
             return a.length - b.length;
         });
-        localStorage.setItem(storageKey, allEntries.join('~//~') + '~//~');
+        try {
+            localStorage.setItem(storageKey, allEntries.join('~//~') + '~//~');
+        } catch (e) {
+            reportError('Ghi tên vào kho truyện thất bại (bộ nhớ trình duyệt đầy)', e);
+            showNotification(`Không lưu được "${chineseText}" vào truyện — bộ nhớ đầy`, 'error');
+            return;
+        }
 
         const shownNow = siteReRender();
         const singleNote = !isMaterializable(chineseText)
