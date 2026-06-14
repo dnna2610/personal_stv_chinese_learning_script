@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.13
+// @version      2.14
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -800,6 +800,17 @@
         const db = loadDB();
         const counts = {};
         let dirty = false;
+
+        // Clear our prior markers first. The site re-renders by mutating the
+        // existing <i> elements in place (reusing them), so a phrase stamped
+        // in an earlier render — e.g. 三人的关系 when it was fully kept —
+        // would otherwise linger on an element whose text has since changed
+        // back to the Vietnamese translation, and a tap would show the wrong
+        // (stale) phrase. Re-stamp fresh from the current render below.
+        document.querySelectorAll('i.stv-learn-phrase, i[data-stv-phrase]').forEach(el => {
+            el.classList.remove('stv-learn-phrase', 'stv-learn-learning');
+            delete el.dataset.stvPhrase;
+        });
 
         // Harvest the Hán-Việt reading (h) for any single-segment DB phrase,
         // even when shown as translation — h is present regardless of
