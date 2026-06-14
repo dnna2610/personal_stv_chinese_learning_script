@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.12
+// @version      2.14
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -618,17 +618,16 @@
         const nameSet = storyNameSet(storyKey);
         const sel = selectActiveForChapter(db, text, nameSet);
 
-        // Adopt the learning phrases the site is already rendering.
+        // Adopt the learning phrases the site is already rendering as kept
+        // Chinese (including phrases split across several segments).
         const renderedNow = [];
         const seenT = new Set();
-        document.querySelectorAll('.contentbox i[t]').forEach(el => {
-            const t = (el.getAttribute('t') || '').trim();
-            if (!t || seenT.has(t) || el.textContent.trim() !== t) return;
-            if (nameSet.has(t)) return; // named → stays Vietnamese
-            const info = db.phrases[t];
-            if (info && info.status !== 'known' && isMaterializable(t)) {
-                seenT.add(t);
-                renderedNow.push(t);
+        findRenderedKeptPhrases(db, nameSet).forEach(({ phrase }) => {
+            if (seenT.has(phrase)) return;
+            const info = db.phrases[phrase];
+            if (info && info.status !== 'known') {
+                seenT.add(phrase);
+                renderedNow.push(phrase);
             }
         });
 
@@ -717,12 +716,13 @@
             p && isMaterializable(p) && text.includes(p) &&
             db.phrases[p] && db.phrases[p].status !== 'known');
 
+        // Count distinct learning phrases actually rendered as kept Chinese
+        // (multi-segment aware), restricted to the set we wrote to storage.
         const rendered = new Set();
-        document.querySelectorAll('.contentbox i[t]').forEach(el => {
-            const t = (el.getAttribute('t') || '').trim();
-            if (storedSelf.has(t) && el.textContent.trim() === t &&
-                db.phrases[t] && db.phrases[t].status !== 'known') {
-                rendered.add(t);
+        findRenderedKeptPhrases(db, storyNameSet(storyKey)).forEach(({ phrase }) => {
+            if (storedSelf.has(phrase) &&
+                db.phrases[phrase] && db.phrases[phrase].status !== 'known') {
+                rendered.add(phrase);
             }
         });
 
@@ -730,6 +730,57 @@
         chapterLearningPresent = sel.learningPresent;
         chapterRenderedLearning = rendered.size;
         if (panelEl) updatePanelStats(Object.keys(lastChapterCounts).length);
+    }
+
+    // Longest DB phrase length in characters (bounds the segment look-ahead
+    // in findRenderedKeptPhrases). Recomputed lazily when the DB changes.
+    function maxPhraseChars(db) {
+        let max = 0;
+        for (const p in db.phrases) {
+            const len = [...p].length;
+            if (len > max) max = len;
+        }
+        return Math.min(max, 8); // clamp: longer runs are clauses, not vocab
+    }
+
+    /**
+     * Find every DB phrase rendered as kept Chinese in the current chapter,
+     * INCLUDING phrases the site splits across several consecutive <i t>
+     * segments — their t attributes concatenate to the phrase, and each
+     * fragment displays its own Chinese. A single <i t="X">X</i> is just the
+     * length-1 case. Greedy longest match, left to right; each segment
+     * belongs to at most one match. Returns [{ phrase, els }] in document
+     * order. Named phrases ($X=Y) render as Vietnamese so they never match.
+     */
+    function findRenderedKeptPhrases(db, nameSet) {
+        const maxChars = maxPhraseChars(db);
+        if (maxChars < 1) return [];
+        const out = [];
+        const consumed = new Set();
+        document.querySelectorAll('.contentbox i[t]').forEach(startEl => {
+            if (consumed.has(startEl)) return;
+            let concat = '';
+            const els = [];
+            let best = null;
+            let el = startEl;
+            while (el && !consumed.has(el)) {
+                const t = (el.getAttribute('t') || '').trim();
+                if (!t || el.textContent.trim() !== t) break; // not kept-Chinese
+                concat += t;
+                els.push(el);
+                if ([...concat].length > maxChars) break;
+                if (db.phrases[concat] && isMaterializable(concat) &&
+                    !(nameSet && nameSet.has(concat))) {
+                    best = { phrase: concat, els: els.slice() };
+                }
+                el = nextAdjacentSegment(el);
+            }
+            if (best) {
+                best.els.forEach(e => consumed.add(e));
+                out.push(best);
+            }
+        });
+        return out;
     }
 
     // =====================================================================
@@ -750,23 +801,53 @@
         const counts = {};
         let dirty = false;
 
+        // Clear our prior markers first. The site re-renders by mutating the
+        // existing <i> elements in place (reusing them), so a phrase stamped
+        // in an earlier render — e.g. 三人的关系 when it was fully kept —
+        // would otherwise linger on an element whose text has since changed
+        // back to the Vietnamese translation, and a tap would show the wrong
+        // (stale) phrase. Re-stamp fresh from the current render below.
+        document.querySelectorAll('i.stv-learn-phrase, i[data-stv-phrase]').forEach(el => {
+            el.classList.remove('stv-learn-phrase', 'stv-learn-learning');
+            delete el.dataset.stvPhrase;
+        });
+
+        // Harvest the Hán-Việt reading (h) for any single-segment DB phrase,
+        // even when shown as translation — h is present regardless of
+        // display. The site's v "meaning" is unreliable MT, so meanings come
+        // from CC-CEDICT, not the page.
         document.querySelectorAll('i[t]').forEach(el => {
             const t = (el.getAttribute('t') || '').trim();
             if (!t) return;
             const info = db.phrases[t];
-            if (!info) return;
-
-            // Harvest only the Hán-Việt reading (h) — a deterministic
-            // phonetic mapping. The site's v "meaning" is vietphrase MT and
-            // unreliable, so meanings come from CC-CEDICT instead (see the
-            // dictionary module), not from the page.
+            if (!info || info.hv) return;
             const h = (el.getAttribute('h') || '').trim();
-            if (h && !info.hv) { info.hv = h; dirty = true; }
+            if (h) { info.hv = h; dirty = true; }
+        });
 
-            if (el.textContent.trim() !== t) return; // rendered as translation
-            el.classList.add('stv-learn-phrase');
-            el.classList.toggle('stv-learn-learning', info.status === 'learning');
-            counts[t] = (counts[t] || 0) + 1;
+        // Tag kept-Chinese phrases (multi-segment aware) for tooltip /
+        // underline / counts.
+        const nameSet = storyNameSet(getLocalStorageKeyFromURL());
+        findRenderedKeptPhrases(db, nameSet).forEach(({ phrase, els }) => {
+            const info = db.phrases[phrase];
+
+            // Multi-segment phrase with no HV yet: join the fragments' h
+            // (HV is per-syllable, so 修 "tu" + 炼 "luyện" → "tu luyện").
+            if (!info.hv && els.length > 1) {
+                const hv = els.map(e => (e.getAttribute('h') || '').trim())
+                    .filter(Boolean).join(' ');
+                if (hv) { info.hv = hv; dirty = true; }
+            }
+
+            // Stamp the FULL phrase on every segment of the run so the
+            // tooltip shows the whole phrase even when the user hovers a
+            // single fragment of it.
+            els.forEach(el => {
+                el.classList.add('stv-learn-phrase');
+                el.classList.toggle('stv-learn-learning', info.status === 'learning');
+                el.dataset.stvPhrase = phrase;
+            });
+            counts[phrase] = (counts[phrase] || 0) + 1;
         });
 
         // Exposure counting, once per chapter (keyed by pathname).
@@ -843,7 +924,11 @@
     }
 
     function showTooltipFor(el) {
-        const phrase = (el.getAttribute('t') || '').trim();
+        // Prefer the full phrase stamped during annotation — for a phrase
+        // split across segments the hovered fragment's own t is only part
+        // of it.
+        const multiSeg = !!el.dataset.stvPhrase;
+        const phrase = (el.dataset.stvPhrase || el.getAttribute('t') || '').trim();
         if (!phrase) return;
         const db = loadDB();
         const info = db.phrases[phrase];
@@ -852,7 +937,9 @@
         tooltipPhrase = phrase;
         const tip = ensureTooltip();
         const py = getPinyin(phrase);
-        const hv = (el.getAttribute('h') || info.hv || '').trim();
+        // For a single-segment phrase the element's own h is the reading;
+        // for a multi-segment one use the joined hv harvested into the DB.
+        const hv = ((multiSeg ? info.hv : el.getAttribute('h')) || info.hv || '').trim();
         // Meaning is filled asynchronously from CC-CEDICT (see fillMeaning).
         const statusLabel = info.status === 'known' ? 'Đã thuộc' : 'Đang học';
         const suggest = info.status === 'learning' && info.exposures >= PROMOTE_SUGGEST_AT;
@@ -1375,9 +1462,13 @@
             const chip = e.target.closest('.stv-chip');
             if (!chip) return;
             const phrase = chip.dataset.phrase;
+            // Annotation stamps the full phrase on every segment of a run,
+            // so this finds multi-segment phrases too (falls back to a
+            // single segment whose own t is the whole phrase).
             const target = [...document.querySelectorAll('i[t]')].find(el =>
-                (el.getAttribute('t') || '').trim() === phrase &&
-                el.textContent.trim() === phrase
+                el.dataset.stvPhrase === phrase ||
+                ((el.getAttribute('t') || '').trim() === phrase &&
+                 el.textContent.trim() === phrase)
             );
             if (!target) return;
             target.scrollIntoView({ behavior: 'smooth', block: 'center' });
