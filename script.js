@@ -950,15 +950,22 @@
     }
 
     function showTooltipFor(el) {
-        // Prefer the full phrase stamped during annotation — for a phrase
-        // split across segments the hovered fragment's own t is only part
-        // of it.
-        const multiSeg = !!el.dataset.stvPhrase;
-        const phrase = (el.dataset.stvPhrase || el.getAttribute('t') || '').trim();
-        if (!phrase) return;
         const db = loadDB();
+        // Show exactly what was tapped. If the segment's own t is itself a DB
+        // phrase, use it — two adjacent words the greedy matcher glued into
+        // one run (不冷 不热 stamped as 不冷不热) must each show their own
+        // tooltip. Fall back to the full phrase stamped during annotation only
+        // when the segment alone isn't a phrase, i.e. it's a fragment of a
+        // site-split word (修 of 修炼).
+        const own = (el.getAttribute('t') || '').trim();
+        const ownIsPhrase = !!(own && db.phrases[own]);
+        const phrase = ownIsPhrase ? own : (el.dataset.stvPhrase || own || '').trim();
+        if (!phrase) return;
         const info = db.phrases[phrase];
         if (!info) return;
+        // A self-contained segment uses its own per-syllable reading; only a
+        // reconstructed split word uses the joined hv harvested into the DB.
+        const multiSeg = !ownIsPhrase && !!el.dataset.stvPhrase;
 
         tooltipPhrase = phrase;
         const tip = ensureTooltip();
