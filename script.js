@@ -194,6 +194,25 @@
         return db;
     }
 
+    /**
+     * Merge `incoming` phrases into `base`, keeping whichever copy of each
+     * phrase was updated most recently. `base` wins ties, and an entry with no
+     * `updated` stamp counts as oldest — so the authoritative IndexedDB copy
+     * (passed as `base`) is never clobbered by a stale localStorage snapshot of
+     * the same word. That clobber was the bug that silently reverted a "known"
+     * phrase back to "learning": Object.assign let the older localStorage copy
+     * win, undoing a status saved in a prior session.
+     */
+    function mergePhrasesByRecency(base, incoming) {
+        const out = Object.assign({}, base);
+        for (const key in incoming) {
+            const cur = out[key];
+            const inc = incoming[key];
+            if (!cur || (inc.updated || 0) > (cur.updated || 0)) out[key] = inc;
+        }
+        return out;
+    }
+
     // Legacy / fallback copy in localStorage; null if absent or unparsable.
     function parseLocalStorageDB() {
         try {
@@ -260,12 +279,17 @@
             if (!stored || !stored.phrases) {
                 stored = legacy || dbMem || freshDB();
             } else if (legacy) {
-                stored.phrases = Object.assign({}, stored.phrases, legacy.phrases);
-                stored.settings = legacy.settings || stored.settings;
+                // IndexedDB is authoritative; the localStorage copy only fills
+                // in phrases IndexedDB lacks (or ones it genuinely updated more
+                // recently). Never let it overwrite a newer saved status.
+                stored.phrases = mergePhrasesByRecency(stored.phrases, legacy.phrases);
+                stored.settings = stored.settings || legacy.settings;
             }
             if (dbMem) {
-                // Changes made this session before IndexedDB resolved win.
-                stored.phrases = Object.assign({}, stored.phrases, dbMem.phrases);
+                // Edits made this session before IndexedDB resolved carry a
+                // fresh `updated` stamp, so recency-merge keeps them; an
+                // untouched stale bootstrap copy does not overwrite IndexedDB.
+                stored.phrases = mergePhrasesByRecency(stored.phrases, dbMem.phrases);
             }
             stored = normalizeDB(stored);
 
@@ -311,7 +335,8 @@
             lapses: 0,
             lastSeen: null,
             hv: '',
-            meaning: ''
+            meaning: '',
+            updated: Date.now()
         };
         if (manual) db.phrases[phrase].manual = true;
         return true;
@@ -857,6 +882,7 @@
                 const info = db.phrases[phrase];
                 info.exposures += Math.min(n, MAX_EXPOSURES_PER_CHAPTER);
                 info.lastSeen = todayStr();
+                info.updated = Date.now();
             });
             sessionStorage.setItem(chapterFlag, '1');
             dirty = true;
@@ -1058,6 +1084,7 @@
             if (info.status === 'known') info.status = 'learning';
             showNotification(`"${phrase}" sẽ được ưu tiên hiện lại`, 'info');
         }
+        info.updated = Date.now();
         saveDB(db);
         if (tooltipEl) tooltipEl.style.display = 'none';
         updatePanelStats();
