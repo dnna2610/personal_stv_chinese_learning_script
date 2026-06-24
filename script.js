@@ -194,6 +194,25 @@
         return db;
     }
 
+    /**
+     * Merge `incoming` phrases into `base`, keeping whichever copy of each
+     * phrase was updated most recently. `base` wins ties, and an entry with no
+     * `updated` stamp counts as oldest — so the authoritative IndexedDB copy
+     * (passed as `base`) is never clobbered by a stale localStorage snapshot of
+     * the same word. That clobber was the bug that silently reverted a "known"
+     * phrase back to "learning": Object.assign let the older localStorage copy
+     * win, undoing a status saved in a prior session.
+     */
+    function mergePhrasesByRecency(base, incoming) {
+        const out = Object.assign({}, base);
+        for (const key in incoming) {
+            const cur = out[key];
+            const inc = incoming[key];
+            if (!cur || (inc.updated || 0) > (cur.updated || 0)) out[key] = inc;
+        }
+        return out;
+    }
+
     // Legacy / fallback copy in localStorage; null if absent or unparsable.
     function parseLocalStorageDB() {
         try {
@@ -260,12 +279,17 @@
             if (!stored || !stored.phrases) {
                 stored = legacy || dbMem || freshDB();
             } else if (legacy) {
-                stored.phrases = Object.assign({}, stored.phrases, legacy.phrases);
-                stored.settings = legacy.settings || stored.settings;
+                // IndexedDB is authoritative; the localStorage copy only fills
+                // in phrases IndexedDB lacks (or ones it genuinely updated more
+                // recently). Never let it overwrite a newer saved status.
+                stored.phrases = mergePhrasesByRecency(stored.phrases, legacy.phrases);
+                stored.settings = stored.settings || legacy.settings;
             }
             if (dbMem) {
-                // Changes made this session before IndexedDB resolved win.
-                stored.phrases = Object.assign({}, stored.phrases, dbMem.phrases);
+                // Edits made this session before IndexedDB resolved carry a
+                // fresh `updated` stamp, so recency-merge keeps them; an
+                // untouched stale bootstrap copy does not overwrite IndexedDB.
+                stored.phrases = mergePhrasesByRecency(stored.phrases, dbMem.phrases);
             }
             stored = normalizeDB(stored);
 
@@ -311,7 +335,8 @@
             lapses: 0,
             lastSeen: null,
             hv: '',
-            meaning: ''
+            meaning: '',
+            updated: Date.now()
         };
         if (manual) db.phrases[phrase].manual = true;
         return true;
@@ -857,6 +882,7 @@
                 const info = db.phrases[phrase];
                 info.exposures += Math.min(n, MAX_EXPOSURES_PER_CHAPTER);
                 info.lastSeen = todayStr();
+                info.updated = Date.now();
             });
             sessionStorage.setItem(chapterFlag, '1');
             dirty = true;
@@ -924,15 +950,22 @@
     }
 
     function showTooltipFor(el) {
-        // Prefer the full phrase stamped during annotation — for a phrase
-        // split across segments the hovered fragment's own t is only part
-        // of it.
-        const multiSeg = !!el.dataset.stvPhrase;
-        const phrase = (el.dataset.stvPhrase || el.getAttribute('t') || '').trim();
-        if (!phrase) return;
         const db = loadDB();
+        // Show exactly what was tapped. If the segment's own t is itself a DB
+        // phrase, use it — two adjacent words the greedy matcher glued into
+        // one run (不冷 不热 stamped as 不冷不热) must each show their own
+        // tooltip. Fall back to the full phrase stamped during annotation only
+        // when the segment alone isn't a phrase, i.e. it's a fragment of a
+        // site-split word (修 of 修炼).
+        const own = (el.getAttribute('t') || '').trim();
+        const ownIsPhrase = !!(own && db.phrases[own]);
+        const phrase = ownIsPhrase ? own : (el.dataset.stvPhrase || own || '').trim();
+        if (!phrase) return;
         const info = db.phrases[phrase];
         if (!info) return;
+        // A self-contained segment uses its own per-syllable reading; only a
+        // reconstructed split word uses the joined hv harvested into the DB.
+        const multiSeg = !ownIsPhrase && !!el.dataset.stvPhrase;
 
         tooltipPhrase = phrase;
         const tip = ensureTooltip();
@@ -1058,6 +1091,7 @@
             if (info.status === 'known') info.status = 'learning';
             showNotification(`"${phrase}" sẽ được ưu tiên hiện lại`, 'info');
         }
+        info.updated = Date.now();
         saveDB(db);
         if (tooltipEl) tooltipEl.style.display = 'none';
         updatePanelStats();
