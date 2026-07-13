@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.16
+// @version      2.17
 // @description  Learn Chinese while reading: all learned phrases + N new (longest-first) kept phrases, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -425,9 +425,16 @@
 
     /**
      * Reconstruct this chapter's raw Chinese text from the rendered DOM:
-     * each <i t> contributes its original Chinese (t), text nodes and <br>
-     * are preserved so phrase boundaries are real. Used to detect which
+     * each <i t> contributes its original Chinese (t), real text nodes and
+     * <br> are preserved so phrase boundaries are real. Used to detect which
      * collected phrases actually occur in the chapter.
+     *
+     * Whitespace-only text nodes are DROPPED: the site space-separates its
+     * Vietnamese tokens, so a phrase it splits across consecutive <i t>
+     * segments (e.g. 你好 → <i t="你">…</i> <i t="好">…</i>) would otherwise
+     * reconstruct as "你 好" and fail text.includes("你好"). Skipping the
+     * separator nodes mirrors nextAdjacentSegment, which already treats a
+     * whitespace-only sibling as a non-boundary when stitching segments.
      */
     function reconstructChapterText() {
         const boxes = document.querySelectorAll('.contentbox');
@@ -437,7 +444,7 @@
         const walk = node => {
             node.childNodes.forEach(n => {
                 if (n.nodeType === Node.TEXT_NODE) {
-                    out += n.textContent;
+                    if (n.textContent.trim()) out += n.textContent;
                 } else if (n.nodeType === Node.ELEMENT_NODE) {
                     if (n.tagName === 'I' && n.hasAttribute('t')) out += n.getAttribute('t');
                     else if (n.tagName === 'BR') out += '\n';
