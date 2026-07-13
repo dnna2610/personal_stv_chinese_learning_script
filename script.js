@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.15
-// @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
+// @version      2.16
+// @description  Learn Chinese while reading: all learned phrases + N new (longest-first) kept phrases, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
 // @match        https://sangtacviet.vip/truyen/*/*
@@ -370,35 +370,37 @@
     }
 
     /**
-     * Pick the phrases that should render as Chinese this session:
-     * all "known" phrases (they cost no mental budget) plus up to
-     * `budget` "learning" phrases, prioritized SRS-style:
-     * never-seen first, then least-recently-seen day, then fewest exposures.
-     * Day-granular lastSeen means the active set rotates between chapters
-     * within a session — that churn is intentional spaced exposure.
+     * Which phrases render this session:
+     *   - ALL "known" (learned) phrases show as Chinese — no budget.
+     *   - up to `budget` "learning" (new) phrases show as learning.
+     * The learning pick is deliberately simple (no SRS): longest phrases
+     * first (they carry the most reading value and are the hardest to pick
+     * up incidentally), same length broken by a STABLE hash so the choice
+     * is arbitrary-but-consistent — the set doesn't reshuffle on re-render
+     * or reload; variety comes from different chapters holding different
+     * words. lastSeen/exposures are still tracked (for the "đã thuộc"
+     * suggestion and Anki) but no longer steer selection.
      * Single-character phrases are excluded (see isMaterializable).
      */
-    // SRS ordering: never-seen first, then least-recently-seen, then fewest
-    // exposures. Used to prioritize which learning phrases fill the budget.
-    function srsCompare(db) {
-        return (a, b) => {
-            const ia = db.phrases[a], ib = db.phrases[b];
-            const seenA = ia.lastSeen || '';
-            const seenB = ib.lastSeen || '';
-            if (seenA !== seenB) return seenA < seenB ? -1 : 1; // '' (never) first
-            if (ia.exposures !== ib.exposures) return ia.exposures - ib.exposures;
-            // Explicit user adds outrank bulk Scan/import adds — typing a
-            // phrase in is a request to see it, even on a day Scan added
-            // dozens of others with the same date.
-            const mA = ia.manual ? 1 : 0, mB = ib.manual ? 1 : 0;
-            if (mA !== mB) return mB - mA;
-            // Among equally-unseen phrases, most recently ADDED first — a
-            // phrase added today (manual/scan) should surface now, not queue
-            // behind thousands of never-seen backlog imports.
-            const addA = ia.added || '', addB = ib.added || '';
-            if (addA !== addB) return addA > addB ? -1 : 1;
-            return 0;
-        };
+    // Stable, order-independent hash of a phrase → used only as a
+    // deterministic tiebreak among equal-length learning phrases.
+    function phraseHash(s) {
+        let h = 0;
+        for (let i = 0; i < s.length; i++) {
+            h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;
+        }
+        return h >>> 0;
+    }
+
+    // Learning-phrase ordering: longer first, then a stable pseudo-random
+    // tiebreak. (To reshuffle same-length picks on every load instead, swap
+    // phraseHash(a)/phraseHash(b) for Math.random()-based values.)
+    function learningSelectionCompare(a, b) {
+        const la = [...a].length, lb = [...b].length;
+        if (la !== lb) return lb - la;          // longer phrase first
+        const ha = phraseHash(a), hb = phraseHash(b);
+        if (ha !== hb) return ha - hb;          // stable "random" tiebreak
+        return a < b ? -1 : a > b ? 1 : 0;      // last resort: deterministic
     }
 
     function selectActivePhrases(db) {
@@ -411,7 +413,7 @@
             else learning.push(phrase);
         });
 
-        learning.sort(srsCompare(db));
+        learning.sort(learningSelectionCompare);
 
         return {
             known,
@@ -479,7 +481,7 @@
             if (info.status === 'known') known.push(phrase);
             else learning.push(phrase);
         });
-        learning.sort(srsCompare(db));
+        learning.sort(learningSelectionCompare);
         const learningActive = learning.slice(0, db.settings.budget);
         const active = [
             ...(db.settings.showKnown ? known : []),
@@ -491,7 +493,7 @@
             learningActive: learningActive.length,
             learningPresent: learning.length,
             knownList: known,
-            learningList: learning // SRS-ordered, present in this chapter
+            learningList: learning // longest-first, present in this chapter
         };
     }
 
@@ -1744,9 +1746,9 @@
         else if (info.status === 'known' && !db.settings.showKnown) { verdict = 'Đã thuộc + đang TẮT "Hiện cụm đã thuộc" → bị ẩn. Bật lại trong bảng Học.'; cls = 'no'; }
         else if (!inText) { verdict = 'Không xuất hiện trong chương này → không được chọn (budget chỉ dành cho cụm có mặt).'; cls = 'no'; }
         else if (info.status !== 'known' && rank >= 0 && !withinBudget) {
-            verdict = `NGUYÊN NHÂN: có trong chương nhưng xếp hạng SRS #${rank + 1}/${sel.learningPresent}, vượt budget ${budget} → bị cắt. ` +
-                `Đã xem ${info.exposures} lần, lần cuối ${info.lastSeen || 'chưa'} → SRS ưu tiên cụm mới/lâu chưa gặp nên cụm quen như thế này bị đẩy xuống cuối. ` +
-                `Tăng budget hoặc đánh dấu "đã thuộc" để nó khỏi chiếm slot.`;
+            verdict = `NGUYÊN NHÂN: là cụm ĐANG HỌC, xếp hạng #${rank + 1}/${sel.learningPresent} (cụm dài xếp trước), vượt budget ${budget} → bị cắt. ` +
+                `Nếu đây là cụm bạn đã thuộc (vd 你好), bấm "✓ Thuộc" để nó vào nhóm ĐÃ THUỘC — nhóm này luôn hiện, không tính budget. ` +
+                `Hoặc tăng slider budget để hiện nhiều cụm đang học hơn.`;
             cls = 'no';
         }
         else if (rendered) { verdict = 'Đang hiển thị đúng như chữ Trung ✓'; cls = 'yes'; }
@@ -1809,7 +1811,7 @@
             `<div class="stv-dbg-check">≥ 2 ký tự (hiển thị được): ${dbgYesNo(d.materializable)}</div>` +
             `<div class="stv-dbg-check">Có trong chương này: ${dbgYesNo(d.inText)}</div>` +
             `<div class="stv-dbg-check">Là name tiếng Việt ở truyện này: ${dbgYesNo(d.isName, 'có (bị chặn)', 'không')}</div>` +
-            `<div class="stv-dbg-check">Hạng SRS trong chương: <b>${rankStr}</b></div>` +
+            `<div class="stv-dbg-check">Hạng chọn (cụm dài trước): <b>${rankStr}</b></div>` +
             `<div class="stv-dbg-check">Trong active set (sẽ ghi): ${dbgYesNo(d.inActiveWrite)}</div>` +
             `<div class="stv-dbg-check">Đã lưu trong kho truyện: ${dbgYesNo(d.inStorage)}</div>` +
             `<div class="stv-dbg-check">Đang render như chữ Trung: ${dbgYesNo(d.rendered)}</div>`;
