@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STV Chinese Learning Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.14
+// @version      2.15
 // @description  Learn Chinese while reading: density-budgeted kept phrases, SRS rotation, pinyin/Hán-Việt/audio tooltips, Anki export
 // @author       You
 // @match        https://sangtacviet.com/truyen/*/*
@@ -1683,6 +1683,208 @@
         ensureButtonBar().appendChild(button);
     }
 
+    // =====================================================================
+    // Debug modal — a read-only diagnostics view. iOS has no console, so
+    // this is the only way to see WHY a phrase does or doesn't render.
+    //
+    // Two parts:
+    //  1. Page/story stats: DB home, budget, present-vs-active-vs-rendered
+    //     counts, storage $X=X count, name-set size.
+    //  2. Phrase inspector: for one phrase (default 你好), every gate it
+    //     must clear to render — in DB, ≥2 chars, present in this chapter,
+    //     not a name here, status, SRS rank vs budget, in storage, rendered
+    //     right now — plus a plain-language verdict. This is what reveals
+    //     the common case: a frequently-seen phrase (你好) sinks to the
+    //     bottom of the SRS order, so it never wins one of the budget slots
+    //     and Áp dụng never re-adds it once it has fallen out of the render.
+    // =====================================================================
+    const dbgEsc = s => String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const dbgYesNo = (ok, yes, no) =>
+        `<span class="stv-dbg-badge ${ok ? 'stv-dbg-yes' : 'stv-dbg-no'}">${ok ? '✓' : '✗'} ${dbgEsc(ok ? (yes || 'có') : (no || 'không'))}</span>`;
+
+    /**
+     * Everything known about one phrase's render eligibility this chapter.
+     * Pure read — mirrors the exact gates applyChapterSet / selectActive-
+     * ForChapter use, so a mismatch here is a mismatch in the real path.
+     */
+    function diagnosePhrase(rawPhrase) {
+        const phrase = (rawPhrase || '').trim();
+        const db = loadDB();
+        const storyKey = getLocalStorageKeyFromURL();
+        const text = reconstructChapterText();
+        const nameSet = storyNameSet(storyKey);
+        const info = db.phrases[phrase] || null;
+        const budget = db.settings.budget;
+
+        const inDB = !!info;
+        const materializable = phrase && isMaterializable(phrase);
+        const inText = !!(phrase && text && text.includes(phrase));
+        const isName = nameSet.has(phrase);
+
+        // SRS position among learning phrases present in this chapter — the
+        // list Áp dụng slices to `budget`. -1 means not eligible (absent,
+        // known, single-char, or a name here).
+        const sel = selectActiveForChapter(db, text, nameSet);
+        const rank = sel.learningList.indexOf(phrase);
+        const withinBudget = rank >= 0 && rank < budget;
+        const inActiveWrite = sel.active.includes(phrase);
+
+        const rendered = findRenderedKeptPhrases(db, nameSet).some(r => r.phrase === phrase);
+        const storedSelf = new Set(parseStorageEntries(localStorage.getItem(storyKey))
+            .filter(e => e.isSelf).map(e => e.left));
+        const inStorage = storedSelf.has(phrase);
+
+        // Plain-language verdict, most-blocking gate first.
+        let verdict, cls;
+        if (!phrase) { verdict = 'Nhập một cụm để kiểm tra.'; cls = 'info'; }
+        else if (!inDB) { verdict = 'Chưa có trong kho học — bấm "Thêm" trong bảng Học để thêm.'; cls = 'no'; }
+        else if (!materializable) { verdict = 'Chỉ 1 ký tự → không bao giờ hiển thị (chỉ dùng cho Anki / nhận diện).'; cls = 'no'; }
+        else if (isName) { verdict = 'Đang là name tiếng Việt trong truyện này → luôn hiện nghĩa, không hiện chữ Trung.'; cls = 'no'; }
+        else if (info.status === 'known' && !db.settings.showKnown) { verdict = 'Đã thuộc + đang TẮT "Hiện cụm đã thuộc" → bị ẩn. Bật lại trong bảng Học.'; cls = 'no'; }
+        else if (!inText) { verdict = 'Không xuất hiện trong chương này → không được chọn (budget chỉ dành cho cụm có mặt).'; cls = 'no'; }
+        else if (info.status !== 'known' && rank >= 0 && !withinBudget) {
+            verdict = `NGUYÊN NHÂN: có trong chương nhưng xếp hạng SRS #${rank + 1}/${sel.learningPresent}, vượt budget ${budget} → bị cắt. ` +
+                `Đã xem ${info.exposures} lần, lần cuối ${info.lastSeen || 'chưa'} → SRS ưu tiên cụm mới/lâu chưa gặp nên cụm quen như thế này bị đẩy xuống cuối. ` +
+                `Tăng budget hoặc đánh dấu "đã thuộc" để nó khỏi chiếm slot.`;
+            cls = 'no';
+        }
+        else if (rendered) { verdict = 'Đang hiển thị đúng như chữ Trung ✓'; cls = 'yes'; }
+        else if (inStorage) { verdict = 'Đã lưu trong kho truyện nhưng chưa render — bấm nút "Chạy" hoặc tải lại trang (F5).'; cls = 'warn'; }
+        else if (withinBudget || inActiveWrite) { verdict = 'Đủ điều kiện — bấm "Áp dụng" trong bảng Học để chọn và hiển thị.'; cls = 'yes'; }
+        else { verdict = 'Đủ điều kiện hiển thị.'; cls = 'yes'; }
+
+        return { phrase, info, inDB, materializable, inText, isName, budget,
+            status: info ? info.status : null, rank, withinBudget, inActiveWrite,
+            rendered, inStorage, learningPresent: sel.learningPresent,
+            showKnown: db.settings.showKnown, verdict, cls };
+    }
+
+    function renderPageStats() {
+        const db = loadDB();
+        const storyKey = getLocalStorageKeyFromURL();
+        const disabled = storyKey && db.settings.disabledStories.includes(storyKey);
+        const text = reconstructChapterText();
+        const nameSet = storyNameSet(storyKey);
+        const { known, learningTotal, singles } = selectActivePhrases(db);
+        const sel = selectActiveForChapter(db, text, nameSet);
+        const renderedCount = findRenderedKeptPhrases(db, nameSet).length;
+        const storedSelf = parseStorageEntries(localStorage.getItem(storyKey))
+            .filter(e => e.isSelf).length;
+        const dbHome = learnIdbBroken ? 'localStorage (fallback!)' : 'IndexedDB';
+
+        const row = (label, value) =>
+            `<div class="stv-dbg-kv"><span>${label}</span><b>${value}</b></div>`;
+
+        return (
+            row('Key truyện', `<code>${dbgEsc(storyKey || '—')}</code>`) +
+            row('DB', `${dbHome}${dbReady ? ' ✓' : ' (đang tải…)'}`) +
+            row('Học cho truyện này', disabled ? 'TẮT' : 'bật') +
+            row('Budget / Hiện đã thuộc / Tự động', `${db.settings.budget} · ${db.settings.showKnown ? 'bật' : 'tắt'} · ${db.settings.autoApply ? 'bật' : 'tắt'}`) +
+            row('Kho học: đang học / đã thuộc / 1 ký tự', `${learningTotal} · ${known.length} · ${singles}`) +
+            row('Độ dài văn bản chương', `${text ? text.length.toLocaleString() : 0} ký tự`) +
+            row('Name tiếng Việt trong truyện ($X=Y)', nameSet.size) +
+            row('Có mặt trong chương: đang học / đã thuộc', `${sel.learningPresent} · ${sel.knownPresent}`) +
+            row('Sẽ chọn khi Áp dụng (active set)', `${sel.active.length} (tối đa ${db.settings.budget} đang học${db.settings.showKnown ? ' + đã thuộc' : ''})`) +
+            row('Đã lưu trong kho truyện ($X=X)', storedSelf) +
+            row('Đang render như chữ Trung', renderedCount)
+        );
+    }
+
+    function renderPhraseDiag(phrase) {
+        const d = diagnosePhrase(phrase);
+        if (!d.phrase) return `<div class="stv-dbg-verdict stv-dbg-v-info">${dbgEsc(d.verdict)}</div>`;
+
+        const meta = d.info
+            ? `thêm ${d.info.added || '—'} · ${d.info.exposures} lần xem · lần cuối ${d.info.lastSeen || 'chưa'} · ${d.info.lapses || 0} lần quên${d.info.manual ? ' · thủ công' : ''}${d.info.hv ? ` · HV: ${dbgEsc(d.info.hv)}` : ''}`
+            : '—';
+
+        const rankStr = d.rank >= 0
+            ? `#${d.rank + 1} / ${d.learningPresent}` + (d.withinBudget ? ` (trong budget ${d.budget})` : ` (ngoài budget ${d.budget})`)
+            : '—';
+
+        const checks =
+            `<div class="stv-dbg-check">Trong kho học: ${dbgYesNo(d.inDB)}${d.inDB ? ` · trạng thái <b>${dbgEsc(d.status)}</b>` : ''}</div>` +
+            (d.inDB ? `<div class="stv-dbg-meta">${meta}</div>` : '') +
+            `<div class="stv-dbg-check">≥ 2 ký tự (hiển thị được): ${dbgYesNo(d.materializable)}</div>` +
+            `<div class="stv-dbg-check">Có trong chương này: ${dbgYesNo(d.inText)}</div>` +
+            `<div class="stv-dbg-check">Là name tiếng Việt ở truyện này: ${dbgYesNo(d.isName, 'có (bị chặn)', 'không')}</div>` +
+            `<div class="stv-dbg-check">Hạng SRS trong chương: <b>${rankStr}</b></div>` +
+            `<div class="stv-dbg-check">Trong active set (sẽ ghi): ${dbgYesNo(d.inActiveWrite)}</div>` +
+            `<div class="stv-dbg-check">Đã lưu trong kho truyện: ${dbgYesNo(d.inStorage)}</div>` +
+            `<div class="stv-dbg-check">Đang render như chữ Trung: ${dbgYesNo(d.rendered)}</div>`;
+
+        return `<div class="stv-dbg-phrase-head">${dbgEsc(d.phrase)}</div>` +
+            checks +
+            `<div class="stv-dbg-verdict stv-dbg-v-${d.cls}">${dbgEsc(d.verdict)}</div>`;
+    }
+
+    let debugModalEl = null;
+    function buildDebugModal() {
+        if (debugModalEl) return debugModalEl;
+        debugModalEl = document.createElement('div');
+        debugModalEl.id = 'stv-debug-overlay';
+        debugModalEl.innerHTML = `
+            <div id="stv-debug-modal" role="dialog" aria-label="Debug">
+                <div class="stv-dbg-title">🐞 Debug — thống kê trang
+                    <span id="stv-dbg-close" title="Đóng">✕</span>
+                </div>
+                <div class="stv-dbg-h">Trang / truyện</div>
+                <div class="stv-dbg-section" id="stv-dbg-page"></div>
+                <div class="stv-dbg-h">Kiểm tra 1 cụm — vì sao hiện / không hiện</div>
+                <div class="stv-dbg-inspect">
+                    <input type="text" id="stv-dbg-phrase" value="你好" autocomplete="off" placeholder="Nhập cụm Trung…">
+                    <button id="stv-dbg-check">Kiểm tra</button>
+                </div>
+                <div class="stv-dbg-section" id="stv-dbg-result"></div>
+            </div>`;
+        document.body.appendChild(debugModalEl);
+
+        const close = () => { debugModalEl.style.display = 'none'; };
+        debugModalEl.querySelector('#stv-dbg-close').addEventListener('click', close);
+        // Tap the dim backdrop (outside the card) to close.
+        debugModalEl.addEventListener('click', e => { if (e.target === debugModalEl) close(); });
+
+        const input = debugModalEl.querySelector('#stv-dbg-phrase');
+        const runCheck = () => {
+            debugModalEl.querySelector('#stv-dbg-result').innerHTML = renderPhraseDiag(input.value);
+        };
+        debugModalEl.querySelector('#stv-dbg-check').addEventListener('click', runCheck);
+        input.addEventListener('keydown', e => {
+            if (e.key === 'Enter') { e.preventDefault(); runCheck(); }
+        });
+        return debugModalEl;
+    }
+
+    function refreshDebugModal() {
+        if (!debugModalEl) return;
+        try {
+            debugModalEl.querySelector('#stv-dbg-page').innerHTML = renderPageStats();
+            const input = debugModalEl.querySelector('#stv-dbg-phrase');
+            debugModalEl.querySelector('#stv-dbg-result').innerHTML = renderPhraseDiag(input.value);
+        } catch (e) {
+            reportError('Debug modal lỗi', e);
+        }
+    }
+
+    function toggleDebugModal() {
+        const modal = buildDebugModal();
+        const show = modal.style.display !== 'flex';
+        modal.style.display = show ? 'flex' : 'none';
+        if (show) refreshDebugModal();
+    }
+
+    /**
+     * Floating "Debug" button — opens the read-only diagnostics modal.
+     */
+    function addDebugButton() {
+        const button = document.createElement('button');
+        button.textContent = 'Debug';
+        styleBarButton(button, '#546E7A', '#455A64');
+        button.addEventListener('click', toggleDebugModal);
+        ensureButtonBar().appendChild(button);
+    }
+
     function injectStyles() {
         const style = document.createElement('style');
         style.textContent = `
@@ -1859,6 +2061,81 @@
                 outline: 1px dashed #F9A825 !important;
                 border-radius: 2px;
             }
+            /* ===== Debug modal ===== */
+            #stv-debug-overlay {
+                display: none;
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.5);
+                z-index: 10003;
+                align-items: center;
+                justify-content: center;
+                padding: 16px;
+                font-family: Arial, sans-serif;
+            }
+            #stv-debug-modal {
+                background: #FAFAFA;
+                color: #212121;
+                width: 100%;
+                max-width: 460px;
+                max-height: calc(100vh - 32px);
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
+                overscroll-behavior: contain;
+                border-radius: 10px;
+                padding: 14px;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+                font-size: 13px;
+            }
+            #stv-debug-modal .stv-dbg-title {
+                font-weight: bold; font-size: 15px;
+                display: flex; justify-content: space-between; align-items: center;
+                position: sticky; top: -14px;
+                margin: -14px -14px 10px; padding: 14px 14px 10px;
+                background: #FAFAFA; z-index: 1;
+            }
+            #stv-debug-modal #stv-dbg-close { cursor: pointer; color: #757575; padding: 4px 8px; }
+            #stv-debug-modal .stv-dbg-h {
+                font-weight: bold; font-size: 12px; text-transform: uppercase;
+                letter-spacing: 0.04em; color: #546E7A; margin: 12px 0 6px;
+            }
+            #stv-debug-modal .stv-dbg-section {
+                background: #fff; border: 1px solid #E0E0E0; border-radius: 8px;
+                padding: 8px 10px;
+            }
+            #stv-debug-modal .stv-dbg-kv {
+                display: flex; justify-content: space-between; gap: 10px;
+                padding: 3px 0; border-bottom: 1px solid #F0F0F0;
+            }
+            #stv-debug-modal .stv-dbg-kv:last-child { border-bottom: none; }
+            #stv-debug-modal .stv-dbg-kv span { color: #616161; }
+            #stv-debug-modal .stv-dbg-kv b { text-align: right; }
+            #stv-debug-modal code { font-size: 11px; word-break: break-all; background: #ECEFF1; padding: 1px 4px; border-radius: 3px; }
+            #stv-debug-modal .stv-dbg-inspect { display: flex; gap: 6px; margin-bottom: 8px; }
+            #stv-debug-modal #stv-dbg-phrase {
+                all: revert; flex: 1; min-width: 0;
+                padding: 8px; font-size: 15px;
+                border: 1px solid #BDBDBD; border-radius: 5px; box-sizing: border-box;
+            }
+            #stv-debug-modal #stv-dbg-check {
+                all: revert; padding: 8px 14px; background: #546E7A; color: #fff;
+                border: none; border-radius: 5px; cursor: pointer; font-size: 14px;
+            }
+            #stv-debug-modal #stv-dbg-check:hover { background: #455A64; }
+            #stv-debug-modal .stv-dbg-phrase-head { font-size: 22px; font-weight: bold; margin-bottom: 6px; }
+            #stv-debug-modal .stv-dbg-check { padding: 3px 0; border-bottom: 1px solid #F0F0F0; }
+            #stv-debug-modal .stv-dbg-meta { color: #78909C; font-size: 11px; padding: 0 0 3px; }
+            #stv-debug-modal .stv-dbg-badge { font-weight: bold; }
+            #stv-debug-modal .stv-dbg-yes { color: #2E7D32; }
+            #stv-debug-modal .stv-dbg-no { color: #C62828; }
+            #stv-debug-modal .stv-dbg-verdict {
+                margin-top: 10px; padding: 10px; border-radius: 8px;
+                font-size: 13px; line-height: 1.5; border-left: 4px solid #90A4AE;
+            }
+            #stv-debug-modal .stv-dbg-v-yes { background: #E8F5E9; border-left-color: #2E7D32; }
+            #stv-debug-modal .stv-dbg-v-no { background: #FFEBEE; border-left-color: #C62828; }
+            #stv-debug-modal .stv-dbg-v-warn { background: #FFF8E1; border-left-color: #F9A825; }
+            #stv-debug-modal .stv-dbg-v-info { background: #E3F2FD; border-left-color: #1976D2; }
             @media (max-width: 480px) {
                 #stv-learn-panel {
                     left: 8px;
@@ -2612,6 +2889,7 @@
             addScanButton();
             addNewHighlightButton();
             addLearnButton();
+            addDebugButton();
             addKeyboardShortcut();
             setupTooltipDelegation();
             monitorForNsbox();
